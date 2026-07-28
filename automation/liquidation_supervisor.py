@@ -23,7 +23,7 @@ def main():
     if a.create_explicit_recovery:
         nft,tok,sym,dec,raw,baseline=a.create_explicit_recovery
         if int(raw)<=0 or int(baseline)<0: raise SystemExit('invalid explicit amounts')
-        r=liquidation.enqueue(tok,sym,int(dec),int(raw),int(baseline),source_reason='operator_confirmed_v4_recovery',source_version='v4',source_token_id=nft,venue_candidates=['kyber'])
+        r=liquidation.enqueue(tok,sym,int(dec),int(raw),int(baseline),source_reason='operator_confirmed_v4_recovery',source_version='v4',source_token_id=nft,venue_candidates=cfg.LIQUIDATION_VENUES)
         print(json.dumps({'created':r and r['id'],'broadcast':False})); return
     print(json.dumps(run_once()))
 if __name__=='__main__': main()

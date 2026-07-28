@@ -105,7 +105,7 @@ def full_exit(pos_key, pos):
         delta=int(ev.get('tokenAmount',0)); protected=max(0,c.erc20_balance(pos['token'])-delta)
         q=liquidation.enqueue(pos['token'],pos.get('symbol'),pos.get('decimals',c.erc20_decimals(pos['token'])),delta,protected,pos['fee'],
             source_reason=pos.get('_exit_reason','lp_exit'),source_version='v3',source_token_id=tid,
-            venue_candidates=['kyber'],emergency=bool(pos.get('_emergency')))
+            venue_candidates=cfg.LIQUIDATION_VENUES,emergency=bool(pos.get('_emergency')))
         if q:q=liquidation.attempt(q)
         return {'closure_confirmed':True,'remove_collect_confirmed':True,'settlement_complete':not q or q.get('phase')=='completed',
                 'exact_proceeds_raw':int(ev['settlementAmount'])+int((q or {}).get('proceeds_raw',0)),
@@ -119,7 +119,7 @@ def full_exit(pos_key, pos):
     print(f'[exit] decrease liquidity token_id={tid}')
     r = decrease_liquidity(tid)
     if r: print(f' dec tx: {r["hash"]} status={r["status"]}')
-    print(f'[exit] collect')
+    print('[exit] collect')
     r = collect_fees(tid)
     print(f' collect tx: {r["hash"]} status={r["status"]}')
     delta=max(0,c.erc20_balance(token)-token_before)

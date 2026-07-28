@@ -17,7 +17,10 @@ class FeeCloseWalTests(unittest.TestCase):
    def burn(_): calls.append(('burn',True)); return {'hash':'b','status':1}
    r=w.advance(r,collect,burn,now=2)
   self.assertEqual(r['phase'],'completed'); self.assertEqual(calls[0],('collect',True))
-  q=w.liquidation.load()[0]; self.assertEqual(q['intended_amount_raw'],7); self.assertEqual(q['protected_preexisting_raw'],50); self.assertEqual(q['venue_candidates'],['kyber'])
+  q=w.liquidation.load()[0]; self.assertEqual(q['intended_amount_raw'],7); self.assertEqual(q['protected_preexisting_raw'],50)
+  # Kyber stays the preferred venue, but settlement is no longer pinned to it: a
+  # sidecar outage used to strand the token in the wallet with no way to sell.
+  self.assertEqual(q['venue_candidates'][0],'kyber'); self.assertIn('v3',q['venue_candidates'])
  def test_collect_failure_retained_for_retry_no_burn(self):
   balances={'tok':[50],cfg.USDG:[9]}
   with patch.object(w.c,'erc20_balance',side_effect=lambda t:balances[t][0]): r=w.prepare(2,'tok','T',18,3000,now=1)

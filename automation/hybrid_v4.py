@@ -352,88 +352,94 @@ def manage(dry_run=None):
     if not positions:return retry_reentry(dry_run)
     rows={str(x['tokenId']):x for x in v4.list_positions()}; actions=[]; now=time.time(); history=load_history()
     for key,pos in list(positions.items()):
-        row=rows.get(str(pos['token_id']))
-        if not row:
-            pending_close=next((r for r in close_wal._load().values() if str(r.get('nft_id'))==str(pos['token_id']) and not r.get('settlementComplete')),None)
-            if pending_close:
-                actions.append({'token':key,'action':'settlement_pending','liquidation_id':pending_close.get('liquidation_id')})
-            else:
-                actions.append({'token':key,'error':'tracked V4 NFT absent; state retained'})
-            continue
-        value=Decimal(str(row.get('valueUsd',0))); fee=Decimal(str(row.get('feeUsd',0))); entry=lp_positions.principal_usdg(pos); reason=None
-        # Backfill a conservative token-side close estimate for legacy positions.
-        # list_positions derives principal from the exact live NFT liquidity/range.
-        # Keep a 5% haircut; this value is used only for reverse-route safety/WAL,
-        # while the close executor independently regenerates exact principal minima.
         try:
-            if str(row.get('sym0','')).upper()=='USDG': token_human=Decimal(str(row['amount1']))
-            elif str(row.get('sym1','')).upper()=='USDG': token_human=Decimal(str(row['amount0']))
-            else: token_human=Decimal(0)
-            predicted=int(token_human*Decimal(10**c.erc20_decimals(pos['token']))*Decimal('0.95'))
-            if predicted>0: pos['expected_close_token_raw']=predicted
-        except Exception:
-            pass
-        peak=max(Decimal(str(pos.get('peak_nav_usdg',0))),value); pos['peak_nav_usdg']=str(peak)
-        if entry and value<entry*(Decimal(1)-cfg.STOP_LOSS_PCT/100): reason='stop_loss'
-        # A position that round-trips a large gain back to break-even shows no loss
-        # against entry, so an entry-anchored stop alone never fires on it.
-        elif peak>0 and value<=peak*(Decimal(1)-cfg.MAX_DRAWDOWN_PCT/100): reason='nav_drawdown'
-        risk=gmgn_assess(pos['token'],force=True); liquidity=row.get('liquidity'); source='stateview'
-        if liquidity is None: liquidity=risk.get('liquidity_usd',risk.get('liquidity')); source='gmgn'
-        tick=row.get('tick',row.get('currentTick'))
-        hist=policy.append_snapshot(history,key,{'tick':tick,'valueUsd':str(value),'feeUsd':str(fee),'liquidity':liquidity,'liquiditySource':source},now)
-        prev_fee=Decimal(str(pos.get('accounting_last_fee_usdg','0'))); gross=Decimal(str(pos.get('gross_fees_usdg','0')))
-        if fee>=prev_fee: gross+=fee-prev_fee
-        dt=max(0,min(600,int(now)-int(pos.get('accounting_last_ts',now))))
-        pos.update(accounting_last_fee_usdg=str(fee),gross_fees_usdg=str(gross),accounting_last_ts=int(now),nav_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))),nav_vs_principal_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))-lp_positions.principal_usdg(pos,default=entry)))
-        if row.get('inRange'): pos['time_in_range_seconds']=int(pos.get('time_in_range_seconds',0))+dt
-        if tick is not None and pos.get('tick_lower') is not None and pos.get('tick_upper') is not None:
-            distance,klass,edge=policy.tick_distance(tick,pos['tick_lower'],pos['tick_upper']); elapsed=policy.continuous_timer(pos,klass,now)
-            m=policy.metrics(hist,now); width,mode=policy.range_width(m.get('realized_vol_1h_pct')); blocked=[]; allowed=False
-            # Guessing the ordering would invert the sides, so an unidentifiable pair
-            # simply keeps the existing symmetric handling instead.
-            sym0,sym1=str(row.get('sym0','')).upper(),str(row.get('sym1','')).upper()
-            side=None
-            if 'USDG' in (sym0,sym1) and sym0!=sym1:
-                side=lp_risk.range_side(tick=tick,tick_lower=pos['tick_lower'],tick_upper=pos['tick_upper'],
-                                     token_is_token0=sym0!='USDG')
-            # Breaking below the range converts the position into 100% of a falling
-            # memecoin. Under stable-first the shallow/medium branches only ever
-            # block, so without this the position would hold that bag indefinitely.
-            if side==lp_risk.BELOW and klass!='in_range' and elapsed>=cfg.OOR_BELOW_MAX_SECONDS:
-                policy.log_decision({'timestamp':now,'token':key,'tick':tick,'classification':klass,'side':side,'elapsed':elapsed,'allowed':True,'blocked':[],'reason':'token_heavy_exit'})
-                actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN)); continue
-            if klass!='in_range' and now<int(pos.get('rebalance_cooldown_until',0)): blocked=['cooldown']
-            elif klass in ('shallow','medium'):
-                if cfg.STRATEGY_MODE == 'stable_first_exit':
-                    blocked=['stable_first_no_recenter']
+            row=rows.get(str(pos['token_id']))
+            if not row:
+                pending_close=next((r for r in close_wal._load().values() if str(r.get('nft_id'))==str(pos['token_id']) and not r.get('settlementComplete')),None)
+                if pending_close:
+                    actions.append({'token':key,'action':'settlement_pending','liquidation_id':pending_close.get('liquidation_id')})
                 else:
-                    confirm=cfg.V4_SHALLOW_CONFIRM_SECONDS if klass=='shallow' else cfg.V4_MEDIUM_CONFIRM_SECONDS
-                    if elapsed<confirm: blocked=['confirmation']
+                    actions.append({'token':key,'error':'tracked V4 NFT absent; state retained'})
+                continue
+            value=Decimal(str(row.get('valueUsd',0))); fee=Decimal(str(row.get('feeUsd',0))); entry=lp_positions.principal_usdg(pos); reason=None
+            # Backfill a conservative token-side close estimate for legacy positions.
+            # list_positions derives principal from the exact live NFT liquidity/range.
+            # Keep a 5% haircut; this value is used only for reverse-route safety/WAL,
+            # while the close executor independently regenerates exact principal minima.
+            try:
+                if str(row.get('sym0','')).upper()=='USDG': token_human=Decimal(str(row['amount1']))
+                elif str(row.get('sym1','')).upper()=='USDG': token_human=Decimal(str(row['amount0']))
+                else: token_human=Decimal(0)
+                predicted=int(token_human*Decimal(10**c.erc20_decimals(pos['token']))*Decimal('0.95'))
+                if predicted>0: pos['expected_close_token_raw']=predicted
+            except Exception:
+                pass
+            peak=max(Decimal(str(pos.get('peak_nav_usdg',0))),value); pos['peak_nav_usdg']=str(peak)
+            if entry and value<entry*(Decimal(1)-cfg.STOP_LOSS_PCT/100): reason='stop_loss'
+            # A position that round-trips a large gain back to break-even shows no loss
+            # against entry, so an entry-anchored stop alone never fires on it.
+            elif peak>0 and value<=peak*(Decimal(1)-cfg.MAX_DRAWDOWN_PCT/100): reason='nav_drawdown'
+            risk=gmgn_assess(pos['token'],force=True); liquidity=row.get('liquidity'); source='stateview'
+            if liquidity is None: liquidity=risk.get('liquidity_usd',risk.get('liquidity')); source='gmgn'
+            tick=row.get('tick',row.get('currentTick'))
+            hist=policy.append_snapshot(history,key,{'tick':tick,'valueUsd':str(value),'feeUsd':str(fee),'liquidity':liquidity,'liquiditySource':source},now)
+            prev_fee=Decimal(str(pos.get('accounting_last_fee_usdg','0'))); gross=Decimal(str(pos.get('gross_fees_usdg','0')))
+            if fee>=prev_fee: gross+=fee-prev_fee
+            dt=max(0,min(600,int(now)-int(pos.get('accounting_last_ts',now))))
+            pos.update(accounting_last_fee_usdg=str(fee),gross_fees_usdg=str(gross),accounting_last_ts=int(now),nav_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))),nav_vs_principal_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))-lp_positions.principal_usdg(pos,default=entry)))
+            if row.get('inRange'): pos['time_in_range_seconds']=int(pos.get('time_in_range_seconds',0))+dt
+            if tick is not None and pos.get('tick_lower') is not None and pos.get('tick_upper') is not None:
+                distance,klass,edge=policy.tick_distance(tick,pos['tick_lower'],pos['tick_upper']); elapsed=policy.continuous_timer(pos,klass,now)
+                m=policy.metrics(hist,now); width,mode=policy.range_width(m.get('realized_vol_1h_pct')); blocked=[]; allowed=False
+                # Guessing the ordering would invert the sides, so an unidentifiable pair
+                # simply keeps the existing symmetric handling instead.
+                sym0,sym1=str(row.get('sym0','')).upper(),str(row.get('sym1','')).upper()
+                side=None
+                if 'USDG' in (sym0,sym1) and sym0!=sym1:
+                    side=lp_risk.range_side(tick=tick,tick_lower=pos['tick_lower'],tick_upper=pos['tick_upper'],
+                                         token_is_token0=sym0!='USDG')
+                # Breaking below the range converts the position into 100% of a falling
+                # memecoin. Under stable-first the shallow/medium branches only ever
+                # block, so without this the position would hold that bag indefinitely.
+                if side==lp_risk.BELOW and klass!='in_range' and elapsed>=cfg.OOR_BELOW_MAX_SECONDS:
+                    policy.log_decision({'timestamp':now,'token':key,'tick':tick,'classification':klass,'side':side,'elapsed':elapsed,'allowed':True,'blocked':[],'reason':'token_heavy_exit'})
+                    actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN)); continue
+                if klass!='in_range' and now<int(pos.get('rebalance_cooldown_until',0)): blocked=['cooldown']
+                elif klass in ('shallow','medium'):
+                    if cfg.STRATEGY_MODE == 'stable_first_exit':
+                        blocked=['stable_first_no_recenter']
                     else:
-                        cost=None
-                        try:
-                            raw=int(value*10**cfg.USDG_DECIMALS); pf=v4.route_preflight(pos['token'],raw); cost=policy.execution_cost_from_preflight(raw,pf,cfg.USDG_DECIMALS)
-                        except Exception: pass
-                        econ,_=policy.economics(hist,cost); allowed,blocked=policy.evidence_gates(klass,m,risk,econ)
-                        if allowed: actions.append(rebalance(key,dict(pos),dry_run if dry_run is not None else cfg.DRY_RUN,now,Decimal('.75') if klass=='medium' else Decimal('1'),width,mode or 'normal')); continue
-            elif klass=='deep':
-                if elapsed<cfg.V4_DEEP_CONFIRM_SECONDS: blocked=['deep_confirmation']
-                elif not risk.get('ok') or risk.get('hard_stop'): allowed=True; actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN,True)); continue
-                else:
-                    try: v4.route_preflight(pos['token'],int(value*10**cfg.USDG_DECIMALS)); allowed=True
-                    except Exception: blocked=['sell_preflight_missing']
-                    if allowed: actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN)); continue
-            policy.log_decision({'timestamp':now,'token':key,'tick':tick,'distance_pct':distance,'classification':klass,'edge_warning_pct':edge,'elapsed':elapsed,'metrics':m,'allowed':allowed,'blocked':blocked,'liquidity_source':source})
-        if now-pos.get('fee_baseline_ts',now)>=cfg.FEE_EVAL_WINDOW_HOURS*3600:
-            delta=fee-Decimal(pos.get('last_fee_usd','0'))
-            if cfg.STRATEGY_MODE != 'stable_first_exit' and delta<cfg.MIN_FEE_3H_USDG: reason='low_fee_rotation'
-            pos.update(fee_baseline_ts=int(now),last_fee_usd=str(fee))
-        if reason:
-            # close_position reloads durable state; persist live conservative metadata first.
-            positions[key]=pos; save(positions)
-            actions.append(close_position(key,reason,dry_run)); continue
-        if fee>=cfg.HARVEST_MIN_USDG: actions.append({'dry_run':True,'action':'collect','token_id':pos['token_id']} if (dry_run if dry_run is not None else cfg.DRY_RUN) else v4.collect(pos['token_id']))
+                        confirm=cfg.V4_SHALLOW_CONFIRM_SECONDS if klass=='shallow' else cfg.V4_MEDIUM_CONFIRM_SECONDS
+                        if elapsed<confirm: blocked=['confirmation']
+                        else:
+                            cost=None
+                            try:
+                                raw=int(value*10**cfg.USDG_DECIMALS); pf=v4.route_preflight(pos['token'],raw); cost=policy.execution_cost_from_preflight(raw,pf,cfg.USDG_DECIMALS)
+                            except Exception: pass
+                            econ,_=policy.economics(hist,cost); allowed,blocked=policy.evidence_gates(klass,m,risk,econ)
+                            if allowed: actions.append(rebalance(key,dict(pos),dry_run if dry_run is not None else cfg.DRY_RUN,now,Decimal('.75') if klass=='medium' else Decimal('1'),width,mode or 'normal')); continue
+                elif klass=='deep':
+                    if elapsed<cfg.V4_DEEP_CONFIRM_SECONDS: blocked=['deep_confirmation']
+                    elif not risk.get('ok') or risk.get('hard_stop'): allowed=True; actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN,True)); continue
+                    else:
+                        try: v4.route_preflight(pos['token'],int(value*10**cfg.USDG_DECIMALS)); allowed=True
+                        except Exception: blocked=['sell_preflight_missing']
+                        if allowed: actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN)); continue
+                policy.log_decision({'timestamp':now,'token':key,'tick':tick,'distance_pct':distance,'classification':klass,'edge_warning_pct':edge,'elapsed':elapsed,'metrics':m,'allowed':allowed,'blocked':blocked,'liquidity_source':source})
+            if now-pos.get('fee_baseline_ts',now)>=cfg.FEE_EVAL_WINDOW_HOURS*3600:
+                delta=fee-Decimal(pos.get('last_fee_usd','0'))
+                if cfg.STRATEGY_MODE != 'stable_first_exit' and delta<cfg.MIN_FEE_3H_USDG: reason='low_fee_rotation'
+                pos.update(fee_baseline_ts=int(now),last_fee_usd=str(fee))
+            if reason:
+                # close_position reloads durable state; persist live conservative metadata first.
+                positions[key]=pos; save(positions)
+                actions.append(close_position(key,reason,dry_run)); continue
+            if fee>=cfg.HARVEST_MIN_USDG: actions.append({'dry_run':True,'action':'collect','token_id':pos['token_id']} if (dry_run if dry_run is not None else cfg.DRY_RUN) else v4.collect(pos['token_id']))
+        except Exception as exc:
+            # One position that cannot be valued or closed must not abort management
+            # of the others; V4 exits are fail-closed and retried on the next tick.
+            actions.append({'token':key,'error':str(exc)[:200],'action':'management_retained'})
+            continue
     current=load()
     for key,pos in positions.items():
         if key in current: current[key]=pos
