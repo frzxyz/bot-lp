@@ -274,6 +274,24 @@ def entry_is_economic(*, expected_fee_usdg: Numeric | None, expected_il_usdg: Nu
     return fee >= cost * m, {'expected_fee_usdg': str(fee), 'required_usdg': str(cost * m)}
 
 
+def edge_ratio(edge: Mapping[str, Any] | None) -> float:
+    """Expected fee divided by what the position must cover, from ``entry_is_economic``.
+
+    A continuous measure of margin: 1.0 is exact breakeven against IL plus cost,
+    below 1.0 loses on expectation.  Returns 0.0 when the economics could not be
+    computed, so an unmeasurable candidate sorts last rather than first.
+    """
+    if not edge:
+        return 0.0
+    try:
+        required = Decimal(str(edge['required_usdg']))
+        if required <= 0:
+            return 0.0
+        return float(Decimal(str(edge['expected_fee_usdg'])) / required)
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return 0.0
+
+
 def gas_within_budget(gas_cost_usdg: Numeric | None, position_usdg: Numeric | None,
                       max_pct: Numeric | None = None) -> bool:
     """Reject an action whose gas eats more than ``max_pct`` of the position."""

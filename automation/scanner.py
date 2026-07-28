@@ -19,6 +19,7 @@ from config import (USDG, WETH, MIN_LIQ_USD, MIN_VOL24_USD, MIN_AGE_HOURS,
 from config import (GMGN_TRENDING_MIN_AGE_HOURS, POSITION_SIZE_USDG,
                     V4_EXECUTION_COST_BUFFER_USDG, MAX_TOP10_PCT)
 from common import get_pool, pool_slot0
+import ohlcv
 import risk as lp_risk
 from gmgn_risk import assess as gmgn_assess
 from v4_backend import quote as quote_v4, discover_pair
@@ -170,6 +171,26 @@ def fomo_score(liq: Decimal, vol24: Decimal, vol_rise_x: float, age_h: float) ->
     return round(max(0, min(100, s)), 1)
 
 
+def candidate_sort_key(c, rotating=False):
+    """Safety, then economics, then everything else.
+
+    The FOMO score rewards exactly the volatility a concentrated range cannot
+    survive, so it ranks last: it only separates candidates whose modelled edge is
+    otherwise identical. ``lp_edge_ratio`` is the margin over breakeven, so a
+    candidate that merely scrapes past the gate no longer outranks a comfortable
+    one just because it looks hotter.
+    """
+    return (
+        not c.get('gmgn_ok', False),
+        not c.get('lp_edge_ok', False),
+        0 if (rotating and c.get('source') == 'gmgn-trending'
+              and Decimal(str(c.get('liq_usd', 0))) < ROTATION_MAX_LIQ_USD) else 1,
+        -float(c.get('lp_edge_ratio') or 0.0),
+        c.get('gmgn_rank') or 999,
+        -float(c.get('score') or 0.0),
+    )
+
+
 def scan():
     if KILL_SWITCH.exists():
         print('halt file present, skip scan', file=sys.stderr); return []
@@ -275,7 +296,18 @@ def scan():
                 rows.append({'timestamp': now, 'tick': int(pool_slot0(pools[c['fee_ppm']])[1])})
             except Exception: pass
         tick_hist[c['token']] = rows[-72:]
-        c['vol_hourly_pct'] = lp_risk.realized_vol_pct_per_hour(rows, now)
+        # Candles first. The snapshot series above needs two scans (30 minutes) to
+        # produce any number at all, so a first-seen token was previously judged on
+        # no volatility data and rejected as incomplete_economics every time. The
+        # tick history remains the fallback and keeps accumulating either way.
+        # The discovered USDG pool is the exact venue being entered; `pair` is
+        # whatever the listing source named and is a synthetic "gmgn:0x…" marker
+        # for trending results, which is not a pool address at all.
+        candle_pool = pools.get(c['fee_ppm']) if pools else None
+        if not candle_pool:
+            listed = str(c.get('pair') or '')
+            candle_pool = listed if listed.startswith('0x') else None
+        c['vol_hourly_pct'], c['vol_source'] = ohlcv.best_effort_vol(candle_pool, rows, now)
         c['suggested_width_pct'] = lp_risk.width_pct_for_vol(c['vol_hourly_pct'])
         c['expected_il_pct'] = lp_risk.expected_adverse_il_pct(c['vol_hourly_pct'], c['suggested_width_pct'])
         c['expected_fee_usdg'] = lp_risk.expected_fee_usdg(
@@ -290,6 +322,10 @@ def scan():
         c['lp_edge_ok'], c['lp_edge'] = lp_risk.entry_is_economic(
             expected_fee_usdg=c['expected_fee_usdg'], expected_il_usdg=expected_il_usdg,
             execution_cost_usdg=execution_cost)
+        # How much margin the LP has, not merely whether it clears the bar. Ranking
+        # on the boolean alone left the trader-oriented FOMO score deciding between
+        # viable candidates, which selects for the volatility that runs a range over.
+        c['lp_edge_ratio'] = lp_risk.edge_ratio(c['lp_edge'])
         c['expected_fee_usdg'] = None if c['expected_fee_usdg'] is None else str(c['expected_fee_usdg'])
 
         # V4 venue discovery + executable 1-USDG quotes. Pick by net output, not raw fee:
@@ -339,12 +375,7 @@ def scan():
     # A high FOMO score means high turnover, which is exactly the volatility that
     # runs a concentrated range over. Rank by whether the LP has a modelled edge
     # first, and only use the momentum score to break ties among viable pools.
-    candidates.sort(key=lambda x: (
-        not x.get('gmgn_ok', False),
-        not x.get('lp_edge_ok', False),
-        0 if (rotating and x.get('source') == 'gmgn-trending' and Decimal(x['liq_usd']) < ROTATION_MAX_LIQ_USD) else 1,
-        x.get('gmgn_rank') or 999,
-        -x['score']))
+    candidates.sort(key=lambda x: candidate_sort_key(x, rotating))
     return candidates, hist
 
 
