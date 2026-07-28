@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+import "./AtomicV4Executor.sol";
+import "./AtomicMocks.sol";
+contract MockPermit2 { mapping(address=>mapping(address=>mapping(address=>uint160))) public a; function approve(address t,address s,uint160 n,uint48) external {a[msg.sender][t][s]=n;} function transferFrom(address from,address to,uint160 n,address t) external {require(a[from][t][msg.sender]>=n,"p2 allow");MockERC20(t).transferFrom(from,to,n);} }
+contract MockV4Swap { bool public fail; uint public rate=1; function setFail(bool x) external {fail=x;} function swap(address tin,address tout,uint256 n,uint256 minOut,address recipient) external returns(uint out){require(!fail,"swap fail");require(recipient==msg.sender,"recipient");MockERC20(tin).transferFrom(msg.sender,address(this),n);out=n*rate;require(out>=minOut,"min");MockERC20(tout).mint(recipient,out);} }
+contract MockV4Posm {
+ struct P {address owner;IV4PositionManager.PoolKey key;uint128 liq;uint a0;uint a1;} mapping(uint=>P) public ps; uint public nextTokenId=1; MockPermit2 public p2; bool public fail;
+ constructor(address p){p2=MockPermit2(p);} function setFail(bool x) external {fail=x;} function ownerOf(uint id) external view returns(address){return ps[id].owner;} function getPositionLiquidity(uint id) external view returns(uint128){return ps[id].liq;} function getPoolAndPositionInfo(uint id) external view returns(IV4PositionManager.PoolKey memory,uint256){return(ps[id].key,0);}
+ function modifyLiquidities(bytes calldata data,uint256) external payable {require(!fail,"posm fail");(uint8 op,bytes memory body)=abi.decode(data,(uint8,bytes));if(op==1){(IV4PositionManager.PoolKey memory k,address recipient,uint128 liq,uint a0,uint a1)=abi.decode(body,(IV4PositionManager.PoolKey,address,uint128,uint256,uint256));p2.transferFrom(msg.sender,address(this),uint160(a0),k.currency0);p2.transferFrom(msg.sender,address(this),uint160(a1),k.currency1);ps[nextTokenId++]=P(recipient,k,liq,a0,a1);}else{(uint id,address recipient)=abi.decode(body,(uint,address));P storage x=ps[id];require(x.liq>0,"closed");x.liq=0;MockERC20(x.key.currency0).mint(recipient,x.a0);MockERC20(x.key.currency1).mint(recipient,x.a1);}}
+}

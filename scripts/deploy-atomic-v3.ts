@@ -1,0 +1,37 @@
+#!/usr/bin/env node
+import { ethers } from "ethers";
+import fs from "node:fs";
+import { provider, wallet } from "../src/chain/client.js";
+import { C, env } from "../src/config.js";
+
+const OWNER="0x3582605Edebf376b684a45E8Faa6D808C22a8e3e";
+const USDG="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
+const artifact=JSON.parse(fs.readFileSync(".hardhat-artifacts/contracts/AtomicV3Executor.sol/AtomicV3Executor.json","utf8"));
+const w=wallet();
+if(w.address.toLowerCase()!==OWNER.toLowerCase()) throw Error("wallet identity mismatch");
+const factory=new ethers.ContractFactory(artifact.abi,artifact.bytecode,w);
+if(!ethers.isAddress(env.kyberRouter)||env.kyberRouter===ethers.ZeroAddress) throw Error("KYBERSWAP_ROUTER_ADDRESS missing/invalid");
+const deployTx=await factory.getDeployTransaction(OWNER,USDG,C.factory,C.positionManager,C.swapRouter02,env.kyberRouter);
+const gas=await provider.estimateGas({...deployTx,from:OWNER});
+const fee=await provider.getFeeData();
+const balance=await provider.getBalance(OWNER);
+const latestNonce=await provider.getTransactionCount(OWNER,"latest"), pendingNonce=await provider.getTransactionCount(OWNER,"pending");
+if(latestNonce!==pendingNonce) throw Error(`pending nonce exists: latest=${latestNonce} pending=${pendingNonce}`);
+const price=fee.maxFeePerGas ?? fee.gasPrice;
+if(!price) throw Error("gas price unavailable");
+const maxCost=gas*price;
+const reserve=500000000000000n;
+if(balance<maxCost+reserve) throw Error(`insufficient native gas balance: need ${maxCost+reserve}, have ${balance}`);
+console.error(JSON.stringify({stage:"preflight",gas:gas.toString(),maxFeePerGas:price.toString(),maxCostWei:maxCost.toString(),balanceWei:balance.toString()}));
+const contract=await factory.deploy(OWNER,USDG,C.factory,C.positionManager,C.swapRouter02,env.kyberRouter,{gasLimit:gas*120n/100n});
+const tx=contract.deploymentTransaction();
+if(!tx) throw Error("missing deployment transaction");
+console.error(JSON.stringify({stage:"broadcast",hash:tx.hash}));
+await contract.waitForDeployment();
+const address=await contract.getAddress();
+const code=(await provider.getCode(address)).toLowerCase();
+const selector=ethers.id("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))").slice(2,10);
+if(!code.includes(selector)) throw Error("deployed runtime missing SwapRouter02 selector");
+const live=new ethers.Contract(address,artifact.abi,provider);
+const result={address,txHash:tx.hash,codeBytes:(code.length-2)/2,owner:await live.owner(),paused:await live.paused(),USDG:await live.USDG(),FACTORY:await live.FACTORY(),POSITION_MANAGER:await live.POSITION_MANAGER(),SWAP_ROUTER:await live.SWAP_ROUTER(),SWAP_TARGET:await live.SWAP_TARGET(),selector};
+console.log(JSON.stringify(result));

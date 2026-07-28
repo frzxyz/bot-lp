@@ -1,0 +1,5 @@
+{
+  "language": "Solidity",
+  "sources": {"contracts/AtomicV3Executor.sol": {"urls": ["contracts/AtomicV3Executor.sol"]}},
+  "settings": {"optimizer": {"enabled": true, "runs": 200}, "viaIR": true, "outputSelection": {"*": {"*": ["abi", "evm.bytecode.object", "evm.deployedBytecode.object"]}}}
+}
