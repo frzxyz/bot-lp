@@ -45,12 +45,21 @@ async function eligiblePool(token:string,requestedPoolId?:string){
   if(!found)throw Error("no discovered live USDG-paired eligible V4 pool");
   return found;
 }
+// A fixed spacing count produces a completely different economic width per fee
+// tier (8 spacings is ~8% at fee 10000 but ~0.8% at fee 500). RH_V4_RANGE_PCT lets
+// the caller ask for a real percentage half-width, converted to whole spacings.
+function halfSpacings(widthSpacings:number,sp:number){
+  const pct=Number(process.env.RH_V4_RANGE_PCT||"0");
+  if(!(pct>0))return Math.max(1,Math.floor(widthSpacings/2));
+  if(pct>=100)throw Error("RH_V4_RANGE_PCT must be below 100");
+  return Math.max(1,Math.round(Math.log1p(pct/100)/Math.log(1.0001)/sp));
+}
 function sdkPool(p:any,m0:any,m1:any){return new Pool(new Token(cfg.chainId,ethers.getAddress(p.poolKey.currency0),m0.decimals,m0.symbol),new Token(cfg.chainId,ethers.getAddress(p.poolKey.currency1),m1.decimals,m1.symbol),p.fee,p.tickSpacing,p.poolKey.hooks,p.sqrtPriceX96.toString(),p.liquidity.toString(),p.tick);}
 export async function generateOpenPlan(token:string,budget:bigint,outFile:string,slippageBps=500,widthSpacings=8,requestedPoolId?:string){
   if(budget<=0n)throw Error("budget must be positive raw USDG");
   if(slippageBps<1||slippageBps>2000)throw Error("slippage bps must be 1..2000");
   const candidate=ethers.getAddress(token),p=await eligiblePool(candidate,requestedPoolId), [m0,m1]=await Promise.all([tokenMeta(p.poolKey.currency0),tokenMeta(p.poolKey.currency1)]), sp=p.tickSpacing;
-  const anchor=Math.floor(p.tick/sp)*sp, half=Math.max(1,Math.floor(widthSpacings/2)), tickLower=anchor-half*sp,tickUpper=anchor+half*sp;
+  const anchor=Math.floor(p.tick/sp)*sp, half=halfSpacings(widthSpacings,sp), tickLower=anchor-half*sp,tickUpper=anchor+half*sp;
   if(!(tickLower<p.tick&&p.tick<tickUpper))throw Error("generated range is not strictly in range");
   // Quote half first, then let the SDK cap liquidity by the exact operation outputs. No balanceOf(wallet) is read.
   const swapAmount=budget/2n; if(swapAmount<=0n||swapAmount>=budget)throw Error("budget too small to split");
@@ -77,7 +86,7 @@ export async function generateInventoryOpenPlan(outFile:string,slippageBps=500,w
   const reserve=2_000_000n,maxEntry=25_000_000n,spendable=usdgWallet>reserve?usdgWallet-reserve:0n,usdgCap=spendable<maxEntry?spendable:maxEntry;
   // Deliberately retain 1% PENG inventory: the plan cannot sweep the wallet even when PENG is limiting.
   const tokenCap=tokenWallet*99n/100n;strict(usdgCap,"spendable USDG after 2 USDG reserve");strict(tokenCap,"PENG inventory cap");
-  const sp=p.tickSpacing,anchor=Math.floor(p.tick/sp)*sp,half=Math.max(1,Math.floor(widthSpacings/2)),tickLower=anchor-half*sp,tickUpper=anchor+half*sp;
+  const sp=p.tickSpacing,anchor=Math.floor(p.tick/sp)*sp,half=halfSpacings(widthSpacings,sp),tickLower=anchor-half*sp,tickUpper=anchor+half*sp;
   if(!(tickLower<p.tick&&p.tick<tickUpper))throw Error("generated range is not strictly in range");
   const pool=sdkPool(p,m0,m1),usdg0=p.poolKey.currency0.toLowerCase()===USDG.toLowerCase(),avail0=usdg0?usdgCap:tokenCap,avail1=usdg0?tokenCap:usdgCap;
   const mk=(a:bigint,b:bigint)=>Position.fromAmounts({pool,tickLower,tickUpper,amount0:a.toString(),amount1:b.toString(),useFullPrecision:true});

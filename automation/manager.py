@@ -10,6 +10,7 @@ from eth_abi import encode, decode
 import common as c
 import config as cfg
 import liquidation
+import risk as lp_risk
 from entry import compute_ticks, get_price_usdg_per_token, mint_lp, swap_usdg_to_token, find_pool, parse_mint_log
 
 POSITIONS_SEL   = '0x99fbab88'  # positions(uint256)
@@ -194,6 +195,7 @@ def main():
         return
     cooldown = load_json(cfg.COOLDOWN_FILE, {})
     fee_history = load_json(cfg.FEE_HISTORY_FILE, {})
+    exit_policy = lp_risk.ExitPolicy.from_config()
     updated = False
     alerts = []
     for key, pos in list(positions.items()):
@@ -205,10 +207,14 @@ def main():
         cur_price = get_price_usdg_per_token(cur_pool, pos['token'])
         entry_price = Decimal(pos['entry_price_usdg'])
         price_change_pct = (cur_price - entry_price) / entry_price * Decimal(100)
-        out_of_range = cur_tick < info['tick_lower'] or cur_tick > info['tick_upper']
         # Simulated collect includes fees accrued since the NFT was last poked;
         # positions().tokensOwed alone can remain zero/stale.
         usdg_is_t0 = info['token0'].lower() == cfg.USDG.lower()
+        token_is_t0 = not usdg_is_t0
+        side = lp_risk.range_side(tick=cur_tick, tick_lower=info['tick_lower'],
+                               tick_upper=info['tick_upper'], token_is_token0=token_is_t0)
+        exposure_pct = lp_risk.live_exposure_pct(tick=cur_tick, tick_lower=info['tick_lower'],
+                                              tick_upper=info['tick_upper'], token_is_token0=token_is_t0)
         collectable0, collectable1 = simulated_collectable(tid)
         fees_usdg_est = Decimal(collectable0 if usdg_is_t0 else collectable1) / Decimal(10**cfg.USDG_DECIMALS)
         fees_tok = Decimal(collectable1 if usdg_is_t0 else collectable0) / Decimal(10**pos['decimals'])
@@ -217,37 +223,45 @@ def main():
         cumulative_fees = Decimal(pos.get('total_fees_collected_usdg','0')) + total_fees_usdg
         fee_3h = fee_window_delta(fee_history, tid, time.time(), cumulative_fees)
         age_h = (time.time() - pos.get('mint_time', 0)) / 3600
-        print(f'[mgr] {pos["symbol"]} tid={tid} tick={cur_tick} range=[{info["tick_lower"]},{info["tick_upper"]}] oor={out_of_range} price=${float(cur_price):.6f} chg={float(price_change_pct):.1f}% fees=${float(total_fees_usdg):.4f} age={age_h:.1f}h liq={info["liquidity"]}')
+        principal = Decimal(str(pos.get('size_usdg', cfg.POSITION_SIZE_USDG)))
+        nav = lp_risk.nav_usdg(tick=cur_tick, tick_lower=info['tick_lower'], tick_upper=info['tick_upper'],
+                            liquidity=info['liquidity'], token_is_token0=token_is_t0) + total_fees_usdg
+        peak_nav = max(Decimal(str(pos.get('peak_nav_usdg', 0))), nav)
+        if str(peak_nav) != str(pos.get('peak_nav_usdg', '')):
+            pos['peak_nav_usdg'] = str(peak_nav); updated = True
+        print(f'[mgr] {pos["symbol"]} tid={tid} tick={cur_tick} range=[{info["tick_lower"]},{info["tick_upper"]}] '
+              f'side={side} exposure={exposure_pct:.0f}% price=${float(cur_price):.6f} chg={float(price_change_pct):.1f}% '
+              f'nav=${float(nav):.4f} peak=${float(peak_nav):.4f} fees=${float(total_fees_usdg):.4f} age={age_h:.1f}h liq={info["liquidity"]}')
 
-        # STOP-LOSS
-        if price_change_pct < -cfg.STOP_LOSS_PCT:
-            print(f'[mgr] STOP-LOSS trigger ({price_change_pct}% < -{cfg.STOP_LOSS_PCT}%) — full exit')
-            full_exit(key, pos)
-            cooldown[key] = int(time.time() + cfg.TOKEN_COOLDOWN_HOURS*3600)
+        # Range timers are per-side: flipping from below to above (or back) restarts
+        # the clock, because the two sides carry completely different risk.
+        now_ts = int(time.time())
+        if side == lp_risk.IN_RANGE:
+            if pos.pop('oor_since', None) is not None:
+                pos.pop('oor_side', None); updated = True
+            oor_elapsed = 0
+        else:
+            if pos.get('oor_side') != side:
+                pos['oor_side'], pos['oor_since'] = side, now_ts; updated = True
+            oor_elapsed = now_ts - int(pos.get('oor_since', now_ts))
+
+        should_exit, exit_reason = lp_risk.exit_decision(
+            nav_usdg=nav, principal_usdg=principal, peak_nav_usdg=peak_nav, side=side,
+            exposure_pct=exposure_pct, oor_elapsed_seconds=oor_elapsed, policy=exit_policy)
+        if should_exit:
+            drawdown = (peak_nav - nav) / peak_nav * 100 if peak_nav > 0 else Decimal(0)
+            print(f'[mgr] EXIT {pos["symbol"]}: {exit_reason} nav=${float(nav):.4f} '
+                  f'drawdown={float(drawdown):.1f}% exposure={exposure_pct:.0f}%')
+            full_exit(key, dict(pos, _exit_reason=exit_reason))
+            # An upside break is a clean recycle, not a bad token: keep its cooldown
+            # short so capital can be redeployed instead of parked for a day.
+            recycle = exit_reason == 'out_of_range_above'
+            cooldown[key] = now_ts + (300 if recycle else cfg.TOKEN_COOLDOWN_HOURS*3600)
             del positions[key]
-            alerts.append(f'❌ STOP-LOSS {pos["symbol"]}: exit at {float(price_change_pct):.1f}%')
+            alerts.append(f'{"♻️" if recycle else "❌"} EXIT {pos["symbol"]} ({exit_reason}): '
+                          f'nav ${float(nav):.2f} vs principal ${float(principal):.2f}')
             updated = True
             continue
-
-        # OUT OF RANGE for too long
-        oor_since = pos.get('oor_since')
-        if out_of_range:
-            if not oor_since:
-                pos['oor_since'] = int(time.time())
-                updated = True
-            elif (time.time() - pos['oor_since']) > cfg.OUT_OF_RANGE_MAX_HOURS*3600:
-                # rebalance: close old, open new around cur price
-                print(f'[mgr] OOR > {cfg.OUT_OF_RANGE_MAX_HOURS}h — rebalance {pos["symbol"]}')
-                full_exit(key, pos)
-                # cooldown short (5m) so scanner->entry re-picks
-                cooldown[key] = int(time.time() + 300)
-                del positions[key]
-                alerts.append(f'♻️ REBALANCE {pos["symbol"]} — full close, will re-enter')
-                updated = True
-                continue
-        else:
-            if oor_since:
-                pos.pop('oor_since', None); updated = True
 
         # LOW-FEE ROTATION: request discovery first; close only after replacement
         # independently passes GMGN, live quote, and round-trip safety validation.

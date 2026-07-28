@@ -5,8 +5,11 @@ Cache limits API use; any unavailable/invalid result fails closed at entry time.
 """
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+import config as cfg
 
 CACHE_FILE = Path(__file__).resolve().parent / "state" / "gmgn_cache.json"
 CACHE_TTL = 15 * 60
@@ -91,8 +94,8 @@ def assess(token, force=False, cache_only=False):
         hard.append("closed_source")
     if max(buy_tax, sell_tax) > 0.10:
         hard.append("tax_over_10pct")
-    if top10 > 0.50:
-        hard.append("top10_over_50pct")
+    if top10 * 100 > float(cfg.MAX_TOP10_PCT):
+        hard.append(f"top10_over_{int(cfg.MAX_TOP10_PCT)}pct")
     # GMGN RH currently exposes behavior ratios rather than a direct wash flag.
     if entrapment > 0.50:
         hard.append("wash_entrapment_over_50pct")

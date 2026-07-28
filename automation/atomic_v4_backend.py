@@ -8,7 +8,7 @@ import liquidation
 ROOT=Path('/root/money-printer-repos/robinhood-lp-bot'); CLI=ROOT/'src/atomic-v4-cli.ts'
 WALLET_KEY=Path('/root/.hermes/wallets/meme-lp-agent/private_key.txt')
 
-def _run(command,*args):
+def _run(command,*args,width_pct=None):
     if not cfg.ATOMIC_LP_ONLY: raise RuntimeError('atomic V4 backend requires ATOMIC_LP_ONLY=true')
     env=dict(os.environ,ATOMIC_LP_ONLY='true',ATOMIC_V4_EXECUTOR_ADDRESS=cfg.ATOMIC_V4_EXECUTOR_ADDRESS,
              RH_RPC_URL='https://rpc.mainnet.chain.robinhood.com',
@@ -16,6 +16,9 @@ def _run(command,*args):
              RH_V4_EXPECTED_WALLET=cfg.WALLET_ADDRESS,
              KYBERSWAP_ROUTER_ADDRESS='0x6131B5fae19EA4f9D964eAc0408E4408b66337b5',
              KYBERSWAP_CHAIN='robinhood')
+    # The plan generator otherwise anchors on a fixed count of tick spacings, whose
+    # economic width swings with the fee tier and ignores the token's volatility.
+    if width_pct is not None: env['RH_V4_RANGE_PCT']=str(width_pct)
     p=subprocess.run(['node','--import','tsx',str(CLI),command,*map(str,args)],cwd=ROOT,env=env,text=True,capture_output=True,timeout=420)
     raw=(p.stdout if p.returncode==0 else p.stderr).strip().splitlines()
     try: data=json.loads(raw[-1])
@@ -23,7 +26,7 @@ def _run(command,*args):
     if p.returncode or not data.get('ok'): raise RuntimeError('atomic V4 CLI: '+str(data.get('error','failed')))
     return data['result']
 
-def capability_preflight(token,amount_raw,pool_id=None):
+def capability_preflight(token,amount_raw,pool_id=None,width_pct=None):
     """Build and validate a candidate-bound plan without broadcasting.
 
     Before the source V3 close, the wallet intentionally does not yet hold the exact
@@ -40,7 +43,7 @@ def capability_preflight(token,amount_raw,pool_id=None):
         # execution still regenerates and simulates once after settlement.
         for attempt in range(3):
             try:
-                plan=_run('generate-open',*args)
+                plan=_run('generate-open',*args,width_pct=width_pct)
                 break
             except RuntimeError as exc:
                 last=exc
@@ -56,20 +59,20 @@ def capability_preflight(token,amount_raw,pool_id=None):
     if not plan.get('swapData') or not plan.get('mintData'): raise RuntimeError('atomic V4 plan calldata missing')
     return {'capable':True,'token':plan['token'],'poolId':pool.get('poolId'),'budget_raw':int(amount_raw)}
 
-def open_position(token,amount_raw,pool_id=None):
+def open_position(token,amount_raw,pool_id=None,width_pct=None):
     lifecycle.assert_new_strategy_allowed('v4')
     amount_raw=int(amount_raw)
     if amount_raw<=0: raise RuntimeError('atomic V4 budget must be positive')
     before={'usdg_raw':c.erc20_balance(cfg.USDG),'token_raw':c.erc20_balance(token)}
     op=lifecycle.prepare('v4','open',token=token,before=before,caps={'usdg_raw':amount_raw},expected={'atomic_receipt_status':1,'unique_opened_event':True,'executor_zero_balances':True},recovery_policy='reconcile_receipt_nft_event_balances;never_compensate_revert')
     try:
-        proof=capability_preflight(token,amount_raw,pool_id)
-        op=lifecycle.transition(op,'preflight_passed',changes={'metadata':{'executor':cfg.ATOMIC_V4_EXECUTOR_ADDRESS,'capability':proof}})
+        proof=capability_preflight(token,amount_raw,pool_id,width_pct)
+        op=lifecycle.transition(op,'preflight_passed',changes={'metadata':{'executor':cfg.ATOMIC_V4_EXECUTOR_ADDRESS,'capability':proof,'range_pct':width_pct}})
         op=lifecycle.transition(op,'broadcasting')
         result=None
         for attempt in range(3):
             try:
-                result=_run('execute-open',token,amount_raw,*([pool_id] if pool_id else []))
+                result=_run('execute-open',token,amount_raw,*([pool_id] if pool_id else []),width_pct=width_pct)
                 break
             except RuntimeError as exc:
                 # This exact error is raised during read-only pool discovery before

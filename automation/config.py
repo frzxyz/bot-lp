@@ -86,17 +86,40 @@ V4_DEFAULT_SETTLEMENT = os.environ.get('V4_DEFAULT_SETTLEMENT', 'USDG').upper()
 if V4_DEFAULT_SETTLEMENT not in V4_SETTLEMENT_ASSETS:
     raise ValueError('V4_DEFAULT_SETTLEMENT must be USDG or WETH')
 GAS_RESERVE_ETH = Decimal('0.0005')      # ~15 tx reserve
-RANGE_PCT = Decimal('50')                # wide range; avoid churn/recentering
+RANGE_PCT = Decimal(os.environ.get('RH_LP_RANGE_PCT', '50'))  # fallback half-width when volatility is unknown
 FEE_TIER = 10000                         # 1% (meme standard)
 FEE_TIER_FALLBACKS = [10000, 3000, 500]  # try these in order if primary unavailable
-STOP_LOSS_PCT = Decimal('10')            # capital-preservation NAV stop
-HARVEST_MIN_USDG = Decimal('2')          # collect fee when >= $2
+STOP_LOSS_PCT = Decimal('10')            # NAV stop vs principal
+HARVEST_MIN_USDG = Decimal(os.environ.get('RH_HARVEST_MIN_USDG', '0.25'))
+
+# --- Range sizing -----------------------------------------------------------
+# Width is derived from measured volatility rather than a fixed ladder: a range
+# narrower than the token's own hourly movement is run over before it earns.
+RANGE_SIGMAS = Decimal(os.environ.get('RH_RANGE_SIGMAS', '2'))
+RANGE_HORIZON_HOURS = Decimal(os.environ.get('RH_RANGE_HORIZON_HOURS', '6'))
+RANGE_MIN_PCT = Decimal(os.environ.get('RH_RANGE_MIN_PCT', '15'))
+RANGE_MAX_PCT = Decimal(os.environ.get('RH_RANGE_MAX_PCT', '80'))
+
+# --- Exit policy ------------------------------------------------------------
+# Below-range means the position holds 100% of a falling memecoin, so it is a
+# fast exit. Above-range means it holds 100% USDG and carries no token risk at
+# all, so it waits instead of paying gas to re-center into a pump.
+OOR_BELOW_MAX_SECONDS = int(os.environ.get('RH_OOR_BELOW_MAX_SECONDS', 15 * 60))
+OOR_ABOVE_MAX_SECONDS = int(os.environ.get('RH_OOR_ABOVE_MAX_SECONDS', 6 * 3600))
+MAX_DRAWDOWN_PCT = Decimal(os.environ.get('RH_MAX_DRAWDOWN_PCT', '12'))
+MAX_TOKEN_EXPOSURE_PCT = Decimal(os.environ.get('RH_MAX_TOKEN_EXPOSURE_PCT', '92'))
+ENTRY_EDGE_MARGIN = Decimal(os.environ.get('RH_ENTRY_EDGE_MARGIN', '1.5'))
+
+# --- Fast crash detection ---------------------------------------------------
+# The 1h baseline leaves a brand-new position unprotected for its first hour,
+# which is exactly when a fresh memecoin is most likely to be dumped.
+FAST_DUMP_WINDOW_SECONDS = int(os.environ.get('RH_FAST_DUMP_WINDOW_SECONDS', 600))
+FAST_DUMP_PCT = Decimal(os.environ.get('RH_FAST_DUMP_PCT', '15'))
+FAST_LIQ_DROP_PCT = Decimal(os.environ.get('RH_FAST_LIQ_DROP_PCT', '20'))
 MIN_FEE_3H_USDG = Decimal('0')           # low-fee rotation disabled in stable-first mode
 FEE_EVAL_WINDOW_HOURS = 3
 ROTATION_MAX_LIQ_USD = Decimal('100000')
 GMGN_TRENDING_MIN_AGE_HOURS = Decimal('168')
-OUT_OF_RANGE_MAX_HOURS = 2
-REBALANCE_COOLDOWN_MIN = 30
 V4_REBALANCE_RETRY_SECONDS = 15 * 60
 V4_SHALLOW_CONFIRM_SECONDS = 20 * 60
 V4_MEDIUM_CONFIRM_SECONDS = 45 * 60

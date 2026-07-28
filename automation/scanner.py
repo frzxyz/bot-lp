@@ -16,8 +16,10 @@ from config import (USDG, WETH, MIN_LIQ_USD, MIN_VOL24_USD, MIN_AGE_HOURS,
                     CANDIDATES_FILE, COOLDOWN_FILE, POSITIONS_FILE,
                     TOKEN_COOLDOWN_HOURS, KILL_SWITCH, FEE_TIER_FALLBACKS,
                     STATE_DIR, ROTATION_REQUEST_FILE, ROTATION_MAX_LIQ_USD)
-from config import GMGN_TRENDING_MIN_AGE_HOURS
-from common import get_pool
+from config import (GMGN_TRENDING_MIN_AGE_HOURS, POSITION_SIZE_USDG,
+                    V4_EXECUTION_COST_BUFFER_USDG, MAX_TOP10_PCT)
+from common import get_pool, pool_slot0
+import risk as lp_risk
 from gmgn_risk import assess as gmgn_assess
 from v4_backend import quote as quote_v4, discover_pair
 from gmgn_trending import trending as gmgn_trending
@@ -253,6 +255,7 @@ def scan():
                          key=lambda x: x.get('gmgn_rank') or 999)[:8]
     candidates = (native + gmgn_ranked)[:MAX_ENRICH_CANDIDATES]
 
+    tick_hist = hist.setdefault('tick', {})
     for c in candidates:
         pools = {}
         for f in FEE_TIER_FALLBACKS:
@@ -262,6 +265,32 @@ def scan():
             except Exception: pass
         c['usdg_pools'] = pools
         c['has_direct_usdg_v3'] = bool(pools)
+        # Volatility is the single biggest driver of LP outcome, and it can only be
+        # measured from a series. Snapshot every candidate so a token has usable
+        # history by the time it is considered for entry.
+        c['fee_ppm'] = min(pools) if pools else FEE_TIER_FALLBACKS[0]
+        rows = [r for r in tick_hist.get(c['token'], []) if now - float(r.get('timestamp', 0)) <= 21600]
+        if pools:
+            try:
+                rows.append({'timestamp': now, 'tick': int(pool_slot0(pools[c['fee_ppm']])[1])})
+            except Exception: pass
+        tick_hist[c['token']] = rows[-72:]
+        c['vol_hourly_pct'] = lp_risk.realized_vol_pct_per_hour(rows, now)
+        c['suggested_width_pct'] = lp_risk.width_pct_for_vol(c['vol_hourly_pct'])
+        c['expected_il_pct'] = lp_risk.expected_adverse_il_pct(c['vol_hourly_pct'], c['suggested_width_pct'])
+        c['expected_fee_usdg'] = lp_risk.expected_fee_usdg(
+            vol24_usd=c['vol24_usd'], liquidity_usd=c['liq_usd'], fee_ppm=c['fee_ppm'],
+            position_usdg=POSITION_SIZE_USDG, width_pct=c['suggested_width_pct'])
+        expected_il_usdg = (abs(Decimal(str(c['expected_il_pct']))) / 100 * POSITION_SIZE_USDG
+                            if c['expected_il_pct'] is not None else None)
+        c['expected_il_usdg'] = None if expected_il_usdg is None else str(expected_il_usdg)
+        # Round trip pays the pool fee twice, plus a gas allowance.
+        execution_cost = (POSITION_SIZE_USDG * Decimal(c['fee_ppm']) / Decimal(1_000_000) * 2
+                          + V4_EXECUTION_COST_BUFFER_USDG)
+        c['lp_edge_ok'], c['lp_edge'] = lp_risk.entry_is_economic(
+            expected_fee_usdg=c['expected_fee_usdg'], expected_il_usdg=expected_il_usdg,
+            execution_cost_usdg=execution_cost)
+        c['expected_fee_usdg'] = None if c['expected_fee_usdg'] is None else str(c['expected_fee_usdg'])
 
         # V4 venue discovery + executable 1-USDG quotes. Pick by net output, not raw fee:
         # ultra-high fee pools can look attractive for farming but destroy entry/exit value.
@@ -295,9 +324,11 @@ def scan():
 
         # Enrich every promoted candidate with GMGN security/smart-money data.
         # Entry trigger independently re-checks this gate before moving funds.
-        risk = gmgn_assess(c['token'], cache_only=True)
-        c['gmgn'] = risk
-        c['gmgn_ok'] = bool(risk.get('ok'))
+        gr = gmgn_assess(c['token'], cache_only=True)
+        c['gmgn'] = gr
+        top10_pct = Decimal(str(gr.get('top10_rate') or 0)) * 100
+        c['top10_pct'] = float(top10_pct)
+        c['gmgn_ok'] = bool(gr.get('ok')) and top10_pct <= MAX_TOP10_PCT
 
     # persist history + prune old vol entries (>24h)
     cutoff = now - 24 * 3600
@@ -305,8 +336,12 @@ def scan():
     save_json(HISTORY_FILE, hist)
 
     rotating = ROTATION_REQUEST_FILE.exists()
+    # A high FOMO score means high turnover, which is exactly the volatility that
+    # runs a concentrated range over. Rank by whether the LP has a modelled edge
+    # first, and only use the momentum score to break ties among viable pools.
     candidates.sort(key=lambda x: (
         not x.get('gmgn_ok', False),
+        not x.get('lp_edge_ok', False),
         0 if (rotating and x.get('source') == 'gmgn-trending' and Decimal(x['liq_usd']) < ROTATION_MAX_LIQ_USD) else 1,
         x.get('gmgn_rank') or 999,
         -x['score']))
