@@ -51,9 +51,9 @@ def _backoff(retries, emergency=False):
 def _save_record(rec):
     rows=load(); rows=[rec if x.get('id')==rec['id'] else x for x in rows]; _atomic(rows)
 
-def _route_quotes(token, amount, rec):
+def _route_quotes(token, amount, rec) -> list[dict]:
     """Read-only exact-input quotes; one bad venue cannot suppress another."""
-    rows=[]; venues=set(rec.get('venue_candidates') or ['kyber','v3','v4'])
+    rows: list[dict] = []; venues=set(rec.get('venue_candidates') or ['kyber','v3','v4'])
     if 'kyber' in venues:
         try:
             from v4_backend import reverse_preflight
@@ -159,10 +159,17 @@ def attempt(rec, now=None, quote_fn=None, send_fn=None):
                 send_fn=lambda token,fee,amount,minimum:v4_backend.swap_exit(token,amount,minimum)
             elif venue=='v4_path':
                 import v4_backend
+                # venue is read off the chosen route, so a non-default venue implies
+                # a route was found.  Checked rather than assumed: a violated invariant
+                # here would index None while about to broadcast a swap.  A raise (not
+                # an assert) so `python -O` cannot strip the guard out of a money path;
+                # the enclosing handler turns it into a backed-off retry.
+                if route is None: raise RuntimeError('v4_path venue without a route')
                 first,second=route['first_pool_id'],route['second_pool_id']
                 send_fn=lambda token,fee,amount,minimum:v4_backend.swap_path(token,amount,minimum,first,second)
             elif venue=='v2':
                 import v4_backend
+                if route is None: raise RuntimeError('v2 venue without a route')
                 route_id=route['route_id']
                 send_fn=lambda token,fee,amount,minimum:v4_backend.swap_v2(token,amount,minimum,route_id)
             else:

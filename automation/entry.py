@@ -13,6 +13,7 @@ from web3 import Web3
 
 import common as c
 import config as cfg
+import positions as lp_positions
 
 MINT_SEL   = '0x88316456'  # NPM.mint((address,address,uint24,int24,int24,uint256,uint256,uint256,uint256,address,uint256))
 SWAP_SEL   = '0x04e45aaf'  # SwapRouter02.exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
@@ -140,10 +141,12 @@ def main():
         positions={}
         try: positions=json.loads(cfg.POSITIONS_FILE.read_text())
         except Exception: pass
-        positions[token.lower()]={'token':token,'symbol':c.erc20_symbol(token),'decimals':tok_dec,'pool':pool,'fee':fee,
-          'tick_lower':tick_lower,'tick_upper':tick_upper,'entry_tick':cur_tick,'entry_price_usdg':str(price),
-          'token_id':token_id,'mint_tx':rc['hash'],'mint_time':int(time.time()),'size_usdg':str(size_usdg),
-          'usdg_deposited':need_usdg,'tok_deposited':int(q.get('tokenOut',0)),'last_action_time':int(time.time()),'atomic':True}
+        positions[token.lower()]=lp_positions.V3Position.opened(
+          token=token,symbol=c.erc20_symbol(token),decimals=tok_dec,pool=pool,fee=fee,
+          token_id=token_id,tick_lower=tick_lower,tick_upper=tick_upper,entry_tick=cur_tick,
+          entry_price_usdg=price,size_usdg=size_usdg,usdg_deposited=need_usdg,
+          tok_deposited=int(q.get('tokenOut',0)),mint_tx=rc['hash'],mint_time=int(time.time()),
+          range_width_percent=width).to_dict()
         tmp=cfg.POSITIONS_FILE.with_suffix('.json.tmp'); tmp.write_text(json.dumps(positions,indent=2)); tmp.replace(cfg.POSITIONS_FILE)
         return {'token_id':token_id,'tx':rc['hash'],'pool':pool,'range':[tick_lower,tick_upper],'atomic':True}
     # Legacy path is reachable only under an explicit ATOMIC_LP_ONLY=false override.
@@ -201,15 +204,12 @@ def main():
     positions = {}
     try: positions = json.loads(cfg.POSITIONS_FILE.read_text())
     except Exception: pass
-    positions[token.lower()] = {
-        'token': token, 'symbol': c.erc20_symbol(token), 'decimals': tok_dec,
-        'pool': pool, 'fee': fee, 'tick_lower': tick_lower, 'tick_upper': tick_upper,
-        'entry_tick': cur_tick, 'entry_price_usdg': str(price),
-        'token_id': token_id, 'mint_tx': mn['hash'],
-        'mint_time': int(time.time()), 'size_usdg': str(size_usdg),
-        'usdg_deposited': usdg_for_mint, 'tok_deposited': tok_for_mint,
-        'last_action_time': int(time.time()),
-    }
+    positions[token.lower()] = lp_positions.V3Position.opened(
+        token=token, symbol=c.erc20_symbol(token), decimals=tok_dec, pool=pool, fee=fee,
+        token_id=token_id, tick_lower=tick_lower, tick_upper=tick_upper, entry_tick=cur_tick,
+        entry_price_usdg=price, size_usdg=size_usdg, usdg_deposited=usdg_for_mint,
+        tok_deposited=tok_for_mint, mint_tx=mn['hash'], mint_time=int(time.time()),
+        range_width_percent=float(cfg.RANGE_PCT), atomic=False).to_dict()
     cfg.POSITIONS_FILE.write_text(json.dumps(positions, indent=2))
     print(f'[entry] saved to {cfg.POSITIONS_FILE}')
     return {'token_id': token_id, 'tx': mn['hash'], 'pool': pool, 'range': [tick_lower, tick_upper]}

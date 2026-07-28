@@ -52,8 +52,10 @@ def _key(version,operation,token,nft,idempotency):
     material=idempotency or f"{version}:{operation}:{str(token).lower()}:{nft or ''}:{uuid.uuid4().hex}"
     return hashlib.sha256(material.encode()).hexdigest()[:32]
 
-def prepare(version:str, operation:str, *, token=None, nft=None, before=None, caps=None,
-            expected=None, recovery_policy=None, deadline=None, idempotency_key=None, metadata=None):
+def prepare(version:str, operation:str, *, token:str|None=None, nft:Any=None,
+            before:dict|None=None, caps:dict|None=None, expected:dict|None=None,
+            recovery_policy:str|None=None, deadline:int|None=None,
+            idempotency_key:str|None=None, metadata:dict|None=None) -> dict:
     if version not in ("v3","v4") or operation not in ("open","close","rebalance"):
         raise ValueError("unsupported lifecycle operation")
     ts=now(); oid=_key(version,operation,token,nft,idempotency_key)
@@ -109,7 +111,8 @@ def assert_new_strategy_allowed(version):
 
 def recovery_allowed(): return not HARD_HALT.exists()
 
-def reconcile_receipts(rec, receipt_fn:Callable[[str],Any], latest_nonce_fn:Callable[[],int]|None=None):
+def reconcile_receipts(rec:dict, receipt_fn:Callable[[str],Any],
+                       latest_nonce_fn:Callable[[],int]|None=None) -> dict:
     """Read-only receipt reconciliation. Never resends/replaces a nonce."""
     if rec["phase"] not in ("broadcasting","confirming","retry","compensating"): return rec
     uncertain=False

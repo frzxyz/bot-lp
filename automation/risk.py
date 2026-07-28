@@ -13,10 +13,19 @@ token-heavy position as fully stable, which is why it has its own tests.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 import config as cfg
+
+#: A time series row: ``{'timestamp': epoch, 'tick': int, ...}``.  Values stay
+#: loosely typed because the rows come straight from persisted JSON snapshots.
+Row = Mapping[str, Any]
+#: Anything convertible to :class:`Decimal` — ``str`` on the wire, ``Decimal``
+#: internally, occasionally ``int``/``float`` from a sidecar quote.
+Numeric = Decimal | str | int | float
 
 TICK_BASE = 1.0001
 LN_TICK_BASE = math.log(TICK_BASE)
@@ -144,7 +153,8 @@ def range_side(*, tick: int, tick_lower: int, tick_upper: int, token_is_token0: 
 # volatility
 # --------------------------------------------------------------------------- #
 
-def realized_vol_pct_per_hour(rows, now: float | None = None, window_seconds: int = 3600) -> float | None:
+def realized_vol_pct_per_hour(rows: Iterable[Row], now: float | None = None,
+                              window_seconds: int = 3600) -> float | None:
     """Time-normalized realized volatility of a tick series, in percent per hour.
 
     Normalizing by elapsed time rather than sample count keeps the figure stable
@@ -211,7 +221,7 @@ def expected_adverse_il_pct(vol_hourly_pct: float | None, width_pct: float | Non
 # economics
 # --------------------------------------------------------------------------- #
 
-def capital_efficiency(width_pct: float) -> float | None:
+def capital_efficiency(width_pct: float | None) -> float | None:
     """Fee multiplier of a ``±width_pct`` range versus the same capital full-range.
 
     Concentrating liquidity multiplies fee income *and* the IL from a given move,
@@ -225,8 +235,9 @@ def capital_efficiency(width_pct: float) -> float | None:
     return None if denominator <= 0 else 2.0 / denominator
 
 
-def expected_fee_usdg(*, vol24_usd, liquidity_usd, fee_ppm, position_usdg,
-                      width_pct, horizon_hours=None) -> Decimal | None:
+def expected_fee_usdg(*, vol24_usd: Numeric, liquidity_usd: Numeric, fee_ppm: Numeric,
+                      position_usdg: Numeric, width_pct: float | None,
+                      horizon_hours: float | None = None) -> Decimal | None:
     """Fee income the position should earn over the horizon at its pool share.
 
     Uses the pool's own 24h volume rather than an assumed APR, so a pool that is
@@ -247,8 +258,9 @@ def expected_fee_usdg(*, vol24_usd, liquidity_usd, fee_ppm, position_usdg,
     return vol24 * horizon / 24 * fee * (effective / (liq + effective))
 
 
-def entry_is_economic(*, expected_fee_usdg, expected_il_usdg, execution_cost_usdg,
-                      margin: Decimal | None = None) -> tuple[bool, dict]:
+def entry_is_economic(*, expected_fee_usdg: Numeric | None, expected_il_usdg: Numeric | None,
+                      execution_cost_usdg: Numeric | None,
+                      margin: Decimal | None = None) -> tuple[bool, dict[str, str]]:
     """Fees over the horizon must cover adverse IL plus round-trip cost, with margin.
 
     Any unknown input fails closed: an LP whose edge cannot be computed does not
@@ -262,7 +274,8 @@ def entry_is_economic(*, expected_fee_usdg, expected_il_usdg, execution_cost_usd
     return fee >= cost * m, {'expected_fee_usdg': str(fee), 'required_usdg': str(cost * m)}
 
 
-def gas_within_budget(gas_cost_usdg, position_usdg, max_pct=None) -> bool:
+def gas_within_budget(gas_cost_usdg: Numeric | None, position_usdg: Numeric | None,
+                      max_pct: Numeric | None = None) -> bool:
     """Reject an action whose gas eats more than ``max_pct`` of the position."""
     if gas_cost_usdg is None or position_usdg is None:
         return False
@@ -296,7 +309,8 @@ class ExitPolicy:
         )
 
 
-def exit_decision(*, nav_usdg, principal_usdg, peak_nav_usdg, side: str,
+def exit_decision(*, nav_usdg: Numeric, principal_usdg: Numeric | None,
+                  peak_nav_usdg: Numeric | None, side: str,
                   exposure_pct: float, oor_elapsed_seconds: int,
                   policy: ExitPolicy) -> tuple[bool, str | None]:
     """Decide whether to close, returning ``(should_exit, reason)``.
@@ -322,8 +336,9 @@ def exit_decision(*, nav_usdg, principal_usdg, peak_nav_usdg, side: str,
     return False, None
 
 
-def dump_detected(history, now: float, *, window_seconds: int, price_drop_pct,
-                  liquidity_drop_pct) -> tuple[bool, str | None]:
+def dump_detected(history: Iterable[Row], now: float, *, window_seconds: int,
+                  price_drop_pct: Numeric,
+                  liquidity_drop_pct: Numeric) -> tuple[bool, str | None]:
     """Short-window crash detector for positions too young for the 1h baseline.
 
     ``history`` rows are ``{'t': epoch, 'price': str, 'usdg_pool': int}``.  The

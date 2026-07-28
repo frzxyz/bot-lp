@@ -38,7 +38,7 @@ def _runaway_ok(now):
 def _process_v4_wal(ts):
     """Reconcile only explicit close intents; never adopt unjournaled inventory."""
     import common as c, liquidation, v4_backend, v4_close_wal
-    rows=v4_close_wal._load(); changes=[]
+    rows=v4_close_wal._load(); changes: list=[]
     if not rows: return changes
     positions={str(x.get('tokenId')) for x in v4_backend.list_positions()}
     for rec in rows.values():

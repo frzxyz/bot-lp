@@ -8,6 +8,7 @@ import adaptive_v4 as policy
 import v4_close_wal as close_wal
 import lifecycle
 import risk as lp_risk
+import positions as lp_positions
 import atomic_v4_backend as atomic_v4
 from gmgn_risk import assess as gmgn_assess
 
@@ -84,10 +85,13 @@ def _proceeds_usdg(result):
 
 def _make_pending(pos,reason,now,proceeds=None,error=''):
     key=pos['token'].lower(); allp=load_pending(); old=allp.get(key,{})
-    principal=Decimal(str(pos.get('principal_usdg',pos.get('entry_value_usd','0'))))
-    prior=Decimal(str(pos.get('compounded_capital_usdg',pos.get('entry_value_usd','0'))))
+    # Alias resolution lives in positions._ALIASES; a record that reaches here with
+    # no capital field at all is malformed and must not be papered over with zero,
+    # which would book the entire position as realized profit.
+    principal=lp_positions.principal_usdg(pos)
+    prior=lp_positions.money(pos,'compounded_capital_usdg',default=principal)
     cumulative=Decimal(str(pos.get('cumulative_realized_profit_usdg','0')))
-    rec={'token':pos['token'],'symbol':pos.get('symbol','?'),'isolated_budget_usdg':None if proceeds is None else str(proceeds),'principal_usdg':str(principal),'last_realized_usdg':None if proceeds is None else str(proceeds),'cumulative_realized_profit_usdg':str(cumulative if proceeds is None else cumulative+proceeds-prior),'peak_capital_usdg':str(max(Decimal(str(pos.get('peak_capital_usdg',prior))),proceeds or Decimal(0))),'reason':reason,'last_error':error,'attempt_count':int(old.get('attempt_count',0)),'next_retry':now,'closed_token_id':str(pos.get('token_id','')),'rebalance_count':int(pos.get('rebalance_count',0))+1,'closed_at':now}
+    rec={'token':pos['token'],'symbol':pos.get('symbol','?'),'isolated_budget_usdg':None if proceeds is None else str(proceeds),'principal_usdg':str(principal),'last_realized_usdg':None if proceeds is None else str(proceeds),'cumulative_realized_profit_usdg':str(cumulative if proceeds is None else cumulative+proceeds-prior),'peak_capital_usdg':str(max(lp_positions.peak_capital_usdg(pos,default=prior),proceeds or Decimal(0))),'reason':reason,'last_error':error,'attempt_count':int(old.get('attempt_count',0)),'next_retry':now,'closed_token_id':str(pos.get('token_id','')),'rebalance_count':int(pos.get('rebalance_count',0))+1,'closed_at':now}
     allp[key]=rec; save_pending(allp); return rec
 
 def _reopen(rec,dry_run=False,now=None):
@@ -114,7 +118,17 @@ def _reopen(rec,dry_run=False,now=None):
     result=atomic_v4.open_position(rec['token'],raw,width_pct=width) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(rec['token'],raw,width)
     key=rec['token'].lower(); positions=load()
     reserve=proceeds-amount
-    positions[key]={'version':'v4','token':rec['token'],'symbol':rec.get('symbol','?'),'token_id':str(result['tokenId']),'poolId':result.get('poolId'),'tick_lower':result.get('tickLower'),'tick_upper':result.get('tickUpper'),'mint_tx':result.get('txHash'),'swap_tx':result.get('swapHash'),'mint_time':now,'entry_value_usd':str(amount),'principal_usdg':rec['principal_usdg'],'last_realized_usdg':rec['last_realized_usdg'],'cumulative_realized_profit_usdg':rec['cumulative_realized_profit_usdg'],'compounded_capital_usdg':str(amount),'isolated_strategy_reserve_usdg':str(reserve),'peak_capital_usdg':rec['peak_capital_usdg'],'last_fee_usd':'0','fee_baseline_ts':now,'rebalance_count':int(rec.get('rebalance_count',1)),'rebalanced_from_token_id':rec.get('closed_token_id'),'rebalanced_at':now,'rebalance_cooldown_until':now+cfg.V4_REBALANCE_COOLDOWN_SECONDS,'range_width_percent':width,'range_mode':rec.get('range_mode','normal')}
+    positions[key]=lp_positions.V4Position.opened(
+      token=rec['token'],symbol=rec.get('symbol','?'),token_id=result['tokenId'],mint_time=now,
+      amount_usdg=amount,poolId=result.get('poolId'),tick_lower=result.get('tickLower'),
+      tick_upper=result.get('tickUpper'),mint_tx=result.get('txHash'),swap_tx=result.get('swapHash'),
+      principal_usdg=rec['principal_usdg'],peak_capital_usdg=rec['peak_capital_usdg'],
+      last_realized_usdg=rec['last_realized_usdg'],
+      cumulative_realized_profit_usdg=rec['cumulative_realized_profit_usdg'],
+      isolated_strategy_reserve_usdg=reserve,range_width_percent=width,
+      range_mode=rec.get('range_mode','normal'),rebalance_count=int(rec.get('rebalance_count',1)),
+      rebalanced_from_token_id=rec.get('closed_token_id'),rebalanced_at=now,
+      rebalance_cooldown_until=now+cfg.V4_REBALANCE_COOLDOWN_SECONDS).to_dict()
     save(positions); return result
 
 def _failure(key,rec,exc,now):
@@ -208,7 +222,11 @@ def enter(cand,dry_run=None):
     if dry_run if dry_run is not None else cfg.DRY_RUN: return {'dry_run':True,'amount_usdg':str(amount)}
     width=entry_width(cand['token'])
     result=atomic_v4.open_position(cand['token'],int(amount*10**cfg.USDG_DECIMALS),width_pct=width) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(cand['token'],int(amount*10**cfg.USDG_DECIMALS)); now=int(time.time()); key=cand['token'].lower(); positions=load()
-    positions[key]={'version':'v4','token':cand['token'],'symbol':cand.get('symbol','?'),'token_id':str(result['tokenId']),'poolId':result.get('poolId'),'tick_lower':result.get('tickLower'),'tick_upper':result.get('tickUpper'),'mint_tx':result.get('txHash'),'swap_tx':result.get('swapHash'),'mint_time':now,'entry_value_usd':str(amount),'principal_usdg':str(amount),'last_realized_usdg':'0','cumulative_realized_profit_usdg':'0','compounded_capital_usdg':str(amount),'peak_capital_usdg':str(amount),'rebalance_count':0,'last_fee_usd':'0','fee_baseline_ts':now}; save(positions); return result
+    positions[key]=lp_positions.V4Position.opened(
+      token=cand['token'],symbol=cand.get('symbol','?'),token_id=result['tokenId'],mint_time=now,
+      amount_usdg=amount,poolId=result.get('poolId'),tick_lower=result.get('tickLower'),
+      tick_upper=result.get('tickUpper'),mint_tx=result.get('txHash'),swap_tx=result.get('swapHash'),
+      range_width_percent=width).to_dict(); save(positions); return result
 
 def enter_isolated_rotation(cand,exact_budget_raw,source,dry_run=False,now=None):
     """Public V4 entry bounded by exact V3 settlement proceeds (never wallet NAV)."""
@@ -236,7 +254,14 @@ def enter_isolated_rotation(cand,exact_budget_raw,source,dry_run=False,now=None)
     if not result.get('tokenId') or not result.get('txHash'): raise RuntimeError('mint closure evidence missing')
     amount=Decimal(raw)/Decimal(10**cfg.USDG_DECIMALS); reserve_rem=Decimal(exact-raw)/Decimal(10**cfg.USDG_DECIMALS)
     key=cand['token'].lower(); positions=load()
-    positions[key]={'version':'v4','token':cand['token'],'symbol':cand.get('symbol','?'),'token_id':str(result['tokenId']),'poolId':result.get('poolId'),'tick_lower':result.get('tickLower'),'tick_upper':result.get('tickUpper'),'mint_tx':result.get('txHash'),'swap_tx':result.get('swapHash'),'mint_time':now,'entry_value_usd':str(amount),'principal_usdg':str(amount),'compounded_capital_usdg':str(amount),'isolated_strategy_reserve_usdg':str(reserve_rem),'rotation_source_version':'v3','rotation_source_token':source.get('source_token'),'rotation_source_token_id':str(source.get('source_token_id')),'exact_close_proceeds_raw':str(exact),'range_width_percent':width,'range_mode':mode,'last_fee_usd':'0','fee_baseline_ts':now}
+    positions[key]=lp_positions.V4Position.opened(
+      token=cand['token'],symbol=cand.get('symbol','?'),token_id=result['tokenId'],mint_time=now,
+      amount_usdg=amount,poolId=result.get('poolId'),tick_lower=result.get('tickLower'),
+      tick_upper=result.get('tickUpper'),mint_tx=result.get('txHash'),swap_tx=result.get('swapHash'),
+      isolated_strategy_reserve_usdg=reserve_rem,range_width_percent=width,range_mode=mode,
+      rotation_source_version='v3',rotation_source_token=source.get('source_token'),
+      rotation_source_token_id=str(source.get('source_token_id')),
+      exact_close_proceeds_raw=str(exact)).to_dict()
     save(positions); return result
 
 def retry_v3_to_v4(dry_run=None,now=None):
@@ -335,7 +360,7 @@ def manage(dry_run=None):
             else:
                 actions.append({'token':key,'error':'tracked V4 NFT absent; state retained'})
             continue
-        value=Decimal(str(row.get('valueUsd',0))); fee=Decimal(str(row.get('feeUsd',0))); entry=Decimal(pos['entry_value_usd']); reason=None
+        value=Decimal(str(row.get('valueUsd',0))); fee=Decimal(str(row.get('feeUsd',0))); entry=lp_positions.principal_usdg(pos); reason=None
         # Backfill a conservative token-side close estimate for legacy positions.
         # list_positions derives principal from the exact live NFT liquidity/range.
         # Keep a 5% haircut; this value is used only for reverse-route safety/WAL,
@@ -360,7 +385,7 @@ def manage(dry_run=None):
         prev_fee=Decimal(str(pos.get('accounting_last_fee_usdg','0'))); gross=Decimal(str(pos.get('gross_fees_usdg','0')))
         if fee>=prev_fee: gross+=fee-prev_fee
         dt=max(0,min(600,int(now)-int(pos.get('accounting_last_ts',now))))
-        pos.update(accounting_last_fee_usdg=str(fee),gross_fees_usdg=str(gross),accounting_last_ts=int(now),nav_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))),nav_vs_principal_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))-Decimal(str(pos.get('principal_usdg',entry)))))
+        pos.update(accounting_last_fee_usdg=str(fee),gross_fees_usdg=str(gross),accounting_last_ts=int(now),nav_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))),nav_vs_principal_usdg=str(value+Decimal(str(pos.get('isolated_strategy_reserve_usdg','0')))-lp_positions.principal_usdg(pos,default=entry)))
         if row.get('inRange'): pos['time_in_range_seconds']=int(pos.get('time_in_range_seconds',0))+dt
         if tick is not None and pos.get('tick_lower') is not None and pos.get('tick_upper') is not None:
             distance,klass,edge=policy.tick_distance(tick,pos['tick_lower'],pos['tick_upper']); elapsed=policy.continuous_timer(pos,klass,now)

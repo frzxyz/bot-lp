@@ -11,7 +11,7 @@ from config import (RPC_URLS, WALLET_DIR, WALLET_ADDRESS, CHAIN_ID,
                     V3_FACTORY, V3_POSITION_MANAGER, V3_QUOTER, V3_SWAP_ROUTER,
                     WETH, USDG, USDG_DECIMALS, MAX_GAS_PRICE_GWEI, KILL_SWITCH)
 
-_w3_cache = {}
+_w3_cache: dict = {}
 WALLET_LOCK = Path('/root/.hermes/state/rh_meme_lp/wallet.lock')
 @contextlib.contextmanager
 def wallet_lock(check_nonce=True):
