@@ -26,6 +26,10 @@ def _run(command,*args,width_pct=None):
     if p.returncode or not data.get('ok'): raise RuntimeError('atomic V4 CLI: '+str(data.get('error','failed')))
     return data['result']
 
+def status():
+    """Read-only executor introspection. Signs nothing and moves nothing."""
+    return _run('status')
+
 def capability_preflight(token,amount_raw,pool_id=None,width_pct=None):
     """Build and validate a candidate-bound plan without broadcasting.
 

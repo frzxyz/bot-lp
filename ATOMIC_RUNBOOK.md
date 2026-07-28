@@ -24,6 +24,25 @@ Preconditions for enabling V4, and their current state:
 
 Steps 3 and 4 are deliberately manual: both move real funds and neither can be discharged offline.
 
+## V4 certification procedure
+
+`automation/v4_certify.py` turns steps 3 and 4 into a reviewable procedure. It has three modes, in increasing order of consequence, and defaults to the harmless one.
+
+```sh
+# 1. Read-only. Signs nothing. Lists every unmet precondition at once.
+npm run v4:check -- --token 0xCANDIDATE
+
+# 2. Build the real plan and eth_call it against the deployed executor. No broadcast.
+cd automation && python3 v4_certify.py --rehearse --token 0xCANDIDATE
+
+# 3. The funded probe. Requires --confirm; refuses without it.
+cd automation && python3 v4_certify.py --execute --confirm --token 0xCANDIDATE --size 1
+```
+
+The probe runs open → collect → close, verifying each step before the next begins, then re-reads the position list to confirm nothing survived. The marker at `V4_LIFECYCLE_MARKER` is written last and only once every postcondition holds; a probe that opens but fails to close leaves **no** marker, so unattended entry stays blocked and the position remains visible to the manager and close WAL like any other. Probe size is capped by `RH_V4_PROBE_MAX_USDG` (default 2 USDG) — a probe proves the machinery, not a thesis.
+
+If `--check` reports `no Kyber selector allowlisted`, that is step 3: send `setSwapSelector(0xe21fd0e9,true)` while paused, then re-check.
+
 ## Safety properties / limitations
 - Chain 4663 guard, owner-only, two-step ownership, starts paused, nonreentrant, 30-minute deadline cap, nonzero minima, exact temporary approvals reset to zero, pool/NFT identity checks, no arbitrary call/delegatecall, and zero lifecycle-token balance at entry/exit.
 - Dirty executor balances fail lifecycle and can only be rescued by owner. This prevents preexisting balances being mistaken for proceeds.
