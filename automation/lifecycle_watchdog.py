@@ -69,7 +69,7 @@ def _process_v4_wal(ts):
         def enqueue(r,delta):
             return liquidation.enqueue(r['token'],r.get('symbol'),r.get('decimals',18),delta,
               r['baseline_token_raw'],source_reason='v4_close_wal',source_version='v4',
-              source_token_id=r['nft_id'],venue_candidates=['kyber'])
+              source_token_id=r['nft_id'],venue_candidates=cfg.LIQUIDATION_VENUES)
         out=v4_close_wal.reconcile(rec,str(rec['nft_id']) in positions,
           c.erc20_balance(rec['token']),c.erc20_balance(cfg.USDG),enqueue)
         queues={x['id']:x for x in liquidation.load()}

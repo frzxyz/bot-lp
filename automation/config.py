@@ -61,6 +61,13 @@ LIQUIDATION_BACKOFF_SECONDS = [15, 30, 60, 120, 300, 900]
 LIQUIDATION_MANUAL_RETRY_SECONDS = 3600
 LIQUIDATION_DUST_RAW = int(os.environ.get('RH_LIQUIDATION_DUST_RAW', '1'))
 LIQUIDATION_MAX_PRICE_IMPACT_PCT = Decimal(os.environ.get('RH_LIQUIDATION_MAX_PRICE_IMPACT_PCT','10'))
+# Settlement venues, in preference order. Kyber is the aggregator and wins ties, but
+# pinning settlement to it alone means a sidecar outage strands the token in the
+# wallet while it keeps falling — the close succeeds and the proceeds never arrive.
+# The queue ranks every venue by realized output and rejects thin routes with a
+# price-impact probe, so offering fallbacks cannot produce a worse fill than Kyber.
+LIQUIDATION_VENUES = [v.strip() for v in os.environ.get(
+    'RH_LIQUIDATION_VENUES', 'kyber,v3,v4,v2').split(',') if v.strip()]
 ROTATION_READY_TTL_SECONDS = 30 * 60
 V3_TO_V4_RETRY_SECONDS = 15 * 60
 V3_TO_V4_EXPIRY_SECONDS = 6 * 3600

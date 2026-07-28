@@ -255,7 +255,7 @@ def quote_v3_exact_input_single(token_in, token_out, fee, amount_in):
     except Exception:
         pass
     # Fallback: simulate real swap via SwapRouter02 sig on our router
-    from config import V3_SWAP_ROUTER, WALLET_ADDRESS
+    from config import WALLET_ADDRESS
     swap_data = '0x04e45aaf' + encode(
         ['(address,address,uint24,address,uint256,uint256,uint160)'],
         [(Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out),

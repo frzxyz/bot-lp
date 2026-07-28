@@ -161,8 +161,17 @@ def main():
     tok_dec = c.erc20_decimals(token)
     # 5) swap ~52% USDG->TOKEN (slightly over 50% since current tick usually needs a bit more token side)
     half_usdg = need_usdg // 2 + int(need_usdg * 0.02)  # 52%
-    # min out: expected * (1 - slippage)
-    expected_tok = Decimal(half_usdg) / Decimal(10**cfg.USDG_DECIMALS) / price * Decimal(10**tok_dec)
+    # min out: quote * (1 - slippage). The expectation has to come from the quoter,
+    # not from spot: a spot-derived figure ignores the pool fee, so on the 1% meme
+    # tier the minimum sat a full fee above anything the pool could return and every
+    # swap reverted. Falling back to spot keeps the fee deduction explicit.
+    try:
+        expected_tok = Decimal(c.quote_v3_exact_input_single(cfg.USDG, token, fee, half_usdg))
+    except Exception as exc:
+        print(f'[entry] quoter unavailable ({str(exc)[:80]}); deriving minimum from spot less fee')
+        expected_tok = (Decimal(half_usdg) / Decimal(10**cfg.USDG_DECIMALS) / price
+                        * Decimal(10**tok_dec) * (Decimal(1) - Decimal(fee) / Decimal(1_000_000)))
+    if expected_tok <= 0: raise RuntimeError('entry swap quote unavailable or zero')
     min_tok_swap = int(expected_tok * (Decimal(1) - cfg.MAX_SLIPPAGE_SWAP_PCT/Decimal(100)))
     # 6) approve USDG to SwapRouter and PositionManager
     print('[entry] approve USDG -> SwapRouter')

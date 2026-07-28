@@ -123,7 +123,7 @@ def close_position(token_id,token=None):
         if token_delta:
             q=liquidation.enqueue(canonical_token,canonical_token[:10],c.erc20_decimals(canonical_token),token_delta,
                 int(before.get('token_raw',0)),source_reason='v4_close',source_version='v4',
-                source_token_id=str(token_id),venue_candidates=['kyber'])
+                source_token_id=str(token_id),venue_candidates=cfg.LIQUIDATION_VENUES)
             result['liquidationId']=q and q['id']
             result['settlementComplete']=False
         result['directUsdgRaw']=int(event.get('settlementAmount',0))

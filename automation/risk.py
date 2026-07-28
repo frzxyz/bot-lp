@@ -349,7 +349,13 @@ def dump_detected(history: Iterable[Row], now: float, *, window_seconds: int,
     if len(rows) < 2:
         return False, None
     base, last = rows[0], rows[-1]
-    if float(last['t']) - float(base['t']) <= 0:
+    # Only a clock going backwards is disqualifying.  Requiring strictly positive
+    # elapsed time silently disabled the detector whenever every sample in the
+    # window shared one timestamp — which is precisely the freshly opened position
+    # this check exists to guard.  A drop observed between two samples is real
+    # regardless of how little time separates them; the window is an upper bound,
+    # not a claim about elapsed time.
+    if float(last['t']) - float(base['t']) < 0:
         return False, None
     p0, p1 = Decimal(str(base['price'])), Decimal(str(last['price']))
     if p0 > 0 and (p1 - p0) / p0 * 100 <= -Decimal(str(price_drop_pct)):

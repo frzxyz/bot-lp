@@ -50,7 +50,7 @@ def advance(rec,collect_fn,burn_fn,now=None):
             amount=max(0,c.erc20_balance(rec['token'])-int(rec['protected_token_raw']))
             q=liquidation.enqueue(rec['token'],rec.get('symbol'),rec['decimals'],amount,
                 rec['protected_token_raw'],rec['fee'],source_reason=rec['reason']+'_fees',source_version='v3-fees',
-                source_token_id=rec['token_id'],venue_candidates=['kyber'],now=now)
+                source_token_id=rec['token_id'],venue_candidates=cfg.LIQUIDATION_VENUES,now=now)
             rec.update(phase='queued',liquidation_id=q and q['id'],updated_at=now); _put(rec)
         if rec['phase']=='queued':
             tx=burn_fn(rec['token_id'])
