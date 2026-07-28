@@ -50,7 +50,7 @@ def fetch(url, tries=4):
 
 def fetch_pairs_dexscreener():
     out=[]
-    pairs=[]
+    pairs: list=[]
     for settlement in (USDG, WETH):
         pairs += fetch(DS_TOKENS_ENDPOINT.format(settlement)).get('pairs') or []
     for p in pairs:

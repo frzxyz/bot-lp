@@ -11,6 +11,7 @@ import common as c
 import config as cfg
 import liquidation
 import risk as lp_risk
+import positions as lp_positions
 from entry import compute_ticks, get_price_usdg_per_token, mint_lp, swap_usdg_to_token, find_pool, parse_mint_log
 
 POSITIONS_SEL   = '0x99fbab88'  # positions(uint256)
@@ -19,6 +20,19 @@ DEC_LIQ_SEL     = '0x0c49ccbe'  # decreaseLiquidity((uint256,uint128,uint256,uin
 BURN_SEL        = '0x42966c68'  # burn(uint256)
 
 MAX_U128 = 2**128 - 1
+
+
+class RotationCloseError(RuntimeError):
+    """A rotation close that stopped part-way, carrying what it had already done.
+
+    The recovery payload (receipts, pre-close balances, any liquidation id) is what
+    lets the journal reconcile without re-broadcasting.  It used to be attached to a
+    bare RuntimeError as an ad-hoc attribute, which no reader could rely on.
+    """
+
+    def __init__(self, message: str, recovery: dict | None = None):
+        super().__init__(message)
+        self.recovery: dict = recovery or {}
 
 def position_info(token_id):
     r = c.eth_call(cfg.V3_POSITION_MANAGER, POSITIONS_SEL + c.word_uint(token_id))
@@ -150,7 +164,7 @@ def settle_v3_rotation(pos):
         if q:
             q=liquidation.attempt(q)
             if q.get('phase')!='completed':
-                err=RuntimeError('liquidation_pending'); err.recovery={'liquidation_id':q['id'],'txs':txs,'wallet_usdg_before_raw':usdg0,'source_token_before_raw':tok0}; raise err
+                raise RotationCloseError('liquidation_pending',{'liquidation_id':q['id'],'txs':txs,'wallet_usdg_before_raw':usdg0,'source_token_before_raw':tok0})
         r=burn_nft(tid); txs['burn']=r
         if not _ok_receipt(r): raise RuntimeError('burn receipt failed')
         try: position_info(tid); gone=False
@@ -159,7 +173,7 @@ def settle_v3_rotation(pos):
         usdg1=c.erc20_balance(cfg.USDG)
         return {'closure_confirmed':True,'exact_proceeds_raw':int((q or {}).get('proceeds_raw',max(0,usdg1-usdg0))),'source_token_delta_raw':delta,'wallet_usdg_before_raw':usdg0,'wallet_usdg_after_raw':usdg1,'txs':txs,'liquidation_id':q and q['id']}
     except Exception as exc:
-        err=RuntimeError(str(exc)); err.recovery={'txs':txs,'wallet_usdg_before_raw':usdg0,'source_token_before_raw':tok0}; raise err
+        raise RotationCloseError(str(exc),{'txs':txs,'wallet_usdg_before_raw':usdg0,'source_token_before_raw':tok0}) from exc
 
 def fee_window_delta(history, token_id, now, cumulative):
     """Append cumulative fee snapshot; return exact >=3h delta once baseline exists."""
@@ -199,124 +213,138 @@ def main():
     updated = False
     alerts = []
     for key, pos in list(positions.items()):
-        tid = pos['token_id']
-        info = position_info(tid)
-        cur_pool = pos['pool']
-        s0 = c.pool_slot0(cur_pool)
-        cur_tick = int(s0[1])
-        cur_price = get_price_usdg_per_token(cur_pool, pos['token'])
-        entry_price = Decimal(pos['entry_price_usdg'])
-        price_change_pct = (cur_price - entry_price) / entry_price * Decimal(100)
-        # Simulated collect includes fees accrued since the NFT was last poked;
-        # positions().tokensOwed alone can remain zero/stale.
-        usdg_is_t0 = info['token0'].lower() == cfg.USDG.lower()
-        token_is_t0 = not usdg_is_t0
-        side = lp_risk.range_side(tick=cur_tick, tick_lower=info['tick_lower'],
-                               tick_upper=info['tick_upper'], token_is_token0=token_is_t0)
-        exposure_pct = lp_risk.live_exposure_pct(tick=cur_tick, tick_lower=info['tick_lower'],
-                                              tick_upper=info['tick_upper'], token_is_token0=token_is_t0)
-        collectable0, collectable1 = simulated_collectable(tid)
-        fees_usdg_est = Decimal(collectable0 if usdg_is_t0 else collectable1) / Decimal(10**cfg.USDG_DECIMALS)
-        fees_tok = Decimal(collectable1 if usdg_is_t0 else collectable0) / Decimal(10**pos['decimals'])
-        fees_tok_in_usdg = fees_tok * cur_price
-        total_fees_usdg = fees_usdg_est + fees_tok_in_usdg
-        cumulative_fees = Decimal(pos.get('total_fees_collected_usdg','0')) + total_fees_usdg
-        fee_3h = fee_window_delta(fee_history, tid, time.time(), cumulative_fees)
-        age_h = (time.time() - pos.get('mint_time', 0)) / 3600
-        principal = Decimal(str(pos.get('size_usdg', cfg.POSITION_SIZE_USDG)))
-        nav = lp_risk.nav_usdg(tick=cur_tick, tick_lower=info['tick_lower'], tick_upper=info['tick_upper'],
-                            liquidity=info['liquidity'], token_is_token0=token_is_t0) + total_fees_usdg
-        peak_nav = max(Decimal(str(pos.get('peak_nav_usdg', 0))), nav)
-        if str(peak_nav) != str(pos.get('peak_nav_usdg', '')):
-            pos['peak_nav_usdg'] = str(peak_nav); updated = True
-        print(f'[mgr] {pos["symbol"]} tid={tid} tick={cur_tick} range=[{info["tick_lower"]},{info["tick_upper"]}] '
-              f'side={side} exposure={exposure_pct:.0f}% price=${float(cur_price):.6f} chg={float(price_change_pct):.1f}% '
-              f'nav=${float(nav):.4f} peak=${float(peak_nav):.4f} fees=${float(total_fees_usdg):.4f} age={age_h:.1f}h liq={info["liquidity"]}')
+        try:
+            tid = pos['token_id']
+            info = position_info(tid)
+            cur_pool = pos['pool']
+            s0 = c.pool_slot0(cur_pool)
+            cur_tick = int(s0[1])
+            cur_price = get_price_usdg_per_token(cur_pool, pos['token'])
+            entry_price = Decimal(pos['entry_price_usdg'])
+            price_change_pct = (cur_price - entry_price) / entry_price * Decimal(100)
+            # Simulated collect includes fees accrued since the NFT was last poked;
+            # positions().tokensOwed alone can remain zero/stale.
+            usdg_is_t0 = info['token0'].lower() == cfg.USDG.lower()
+            token_is_t0 = not usdg_is_t0
+            side = lp_risk.range_side(tick=cur_tick, tick_lower=info['tick_lower'],
+                                   tick_upper=info['tick_upper'], token_is_token0=token_is_t0)
+            exposure_pct = lp_risk.live_exposure_pct(tick=cur_tick, tick_lower=info['tick_lower'],
+                                                  tick_upper=info['tick_upper'], token_is_token0=token_is_t0)
+            collectable0, collectable1 = simulated_collectable(tid)
+            fees_usdg_est = Decimal(collectable0 if usdg_is_t0 else collectable1) / Decimal(10**cfg.USDG_DECIMALS)
+            fees_tok = Decimal(collectable1 if usdg_is_t0 else collectable0) / Decimal(10**pos['decimals'])
+            fees_tok_in_usdg = fees_tok * cur_price
+            total_fees_usdg = fees_usdg_est + fees_tok_in_usdg
+            cumulative_fees = Decimal(pos.get('total_fees_collected_usdg','0')) + total_fees_usdg
+            fee_3h = fee_window_delta(fee_history, tid, time.time(), cumulative_fees)
+            age_h = (time.time() - pos.get('mint_time', 0)) / 3600
+            # Committed capital is the denominator of every exit test, so it is read
+            # through the typed accessor and is allowed to fail loudly.  Defaulting it
+            # to the config constant would make the stop-loss measure a position that
+            # does not exist.
+            principal = lp_positions.principal_usdg(pos)
+            nav = lp_risk.nav_usdg(tick=cur_tick, tick_lower=info['tick_lower'], tick_upper=info['tick_upper'],
+                                liquidity=info['liquidity'], token_is_token0=token_is_t0) + total_fees_usdg
+            peak_nav = max(Decimal(str(pos.get('peak_nav_usdg', 0))), nav)
+            if str(peak_nav) != str(pos.get('peak_nav_usdg', '')):
+                pos['peak_nav_usdg'] = str(peak_nav); updated = True
+            print(f'[mgr] {pos["symbol"]} tid={tid} tick={cur_tick} range=[{info["tick_lower"]},{info["tick_upper"]}] '
+                  f'side={side} exposure={exposure_pct:.0f}% price=${float(cur_price):.6f} chg={float(price_change_pct):.1f}% '
+                  f'nav=${float(nav):.4f} peak=${float(peak_nav):.4f} fees=${float(total_fees_usdg):.4f} age={age_h:.1f}h liq={info["liquidity"]}')
 
-        # Range timers are per-side: flipping from below to above (or back) restarts
-        # the clock, because the two sides carry completely different risk.
-        now_ts = int(time.time())
-        if side == lp_risk.IN_RANGE:
-            if pos.pop('oor_since', None) is not None:
-                pos.pop('oor_side', None); updated = True
-            oor_elapsed = 0
-        else:
-            if pos.get('oor_side') != side:
-                pos['oor_side'], pos['oor_since'] = side, now_ts; updated = True
-            oor_elapsed = now_ts - int(pos.get('oor_since', now_ts))
+            # Range timers are per-side: flipping from below to above (or back) restarts
+            # the clock, because the two sides carry completely different risk.
+            now_ts = int(time.time())
+            if side == lp_risk.IN_RANGE:
+                if pos.pop('oor_since', None) is not None:
+                    pos.pop('oor_side', None); updated = True
+                oor_elapsed = 0
+            else:
+                if pos.get('oor_side') != side:
+                    pos['oor_side'], pos['oor_since'] = side, now_ts; updated = True
+                oor_elapsed = now_ts - int(pos.get('oor_since', now_ts))
 
-        should_exit, exit_reason = lp_risk.exit_decision(
-            nav_usdg=nav, principal_usdg=principal, peak_nav_usdg=peak_nav, side=side,
-            exposure_pct=exposure_pct, oor_elapsed_seconds=oor_elapsed, policy=exit_policy)
-        if should_exit:
-            drawdown = (peak_nav - nav) / peak_nav * 100 if peak_nav > 0 else Decimal(0)
-            print(f'[mgr] EXIT {pos["symbol"]}: {exit_reason} nav=${float(nav):.4f} '
-                  f'drawdown={float(drawdown):.1f}% exposure={exposure_pct:.0f}%')
-            full_exit(key, dict(pos, _exit_reason=exit_reason))
-            # An upside break is a clean recycle, not a bad token: keep its cooldown
-            # short so capital can be redeployed instead of parked for a day.
-            recycle = exit_reason == 'out_of_range_above'
-            cooldown[key] = now_ts + (300 if recycle else cfg.TOKEN_COOLDOWN_HOURS*3600)
-            del positions[key]
-            alerts.append(f'{"♻️" if recycle else "❌"} EXIT {pos["symbol"]} ({exit_reason}): '
-                          f'nav ${float(nav):.2f} vs principal ${float(principal):.2f}')
-            updated = True
-            continue
-
-        # LOW-FEE ROTATION: request discovery first; close only after replacement
-        # independently passes GMGN, live quote, and round-trip safety validation.
-        if fee_3h is not None and fee_3h < cfg.MIN_FEE_3H_USDG:
-            request = {'ts': int(time.time()), 'token_id': tid, 'token': pos['token'],
-                       'symbol': pos['symbol'], 'fee_3h_usdg': str(fee_3h),
-                       'threshold_usdg': str(cfg.MIN_FEE_3H_USDG), 'status': 'searching'}
-            save_json(cfg.ROTATION_REQUEST_FILE, request)
-            ready = load_json(cfg.ROTATION_READY_FILE, {})
-            fresh=(ready.get('source_token_id') == tid and int(ready.get('validated_at',ready.get('ts',0))) <= time.time() < int(ready.get('expires_at',0)))
-            if fresh:
-                from rotation import revalidate_ready, prepare_pending, update_pending
-                estimated_raw=int(Decimal(str(pos.get('entry_value_usdg',pos.get('entry_value_usd',cfg.POSITION_SIZE_USDG))))*Decimal(10**cfg.USDG_DECIMALS))
-                try:
-                    evidence=revalidate_ready(ready,pos,estimated_raw)
-                    # Mandatory before journal phase or source mutation: prove the deployed
-                    # executor can simulate immutable generic open calldata at the PONS/source estimate.
-                    if ready.get('target_version')=='v4':
-                        import atomic_v4_backend
-                        candidate_pool=ready.get('candidate_pool') or (ready.get('validation_evidence') or {}).get('pool') or {}
-                        pool_id=candidate_pool.get('poolId')
-                        if not pool_id:
-                            raise RuntimeError('rotation-ready V4 candidate missing poolId')
-                        evidence['atomic_open']=atomic_v4_backend.capability_preflight(ready['token'],estimated_raw,pool_id)
-                except Exception as exc:
-                    print(f'[mgr] rotation retained: revalidation failed: {str(exc)[:160]}'); continue
-                print(f'[mgr] ROTATE {pos["symbol"]}: fee3h=${float(fee_3h):.2f}; replacement={ready.get("symbol")}')
-                pending=prepare_pending(ready,pos,evidence) if ready.get('target_version')=='v4' else None
-                if pending:
-                    pending=update_pending(pending,'closing',wallet_usdg_before_raw=c.erc20_balance(cfg.USDG),source_token_before_raw=c.erc20_balance(pos['token']))
-                try: result=settle_v3_rotation(pos)
-                except Exception as exc:
-                    if pending:update_pending(pending,'liquidation_pending' if str(exc)=='liquidation_pending' else 'recovery',last_error=str(exc)[:300],recovery=getattr(exc,'recovery',{}))
-                    print('[mgr] rotation close incomplete; recovery retained'); continue
-                if pending:update_pending(pending,'settled',settlement=result,exact_proceeds_raw=result['exact_proceeds_raw'],txs=result['txs'])
-                cooldown[key] = int(time.time() + cfg.TOKEN_COOLDOWN_HOURS*3600)
+            should_exit, exit_reason = lp_risk.exit_decision(
+                nav_usdg=nav, principal_usdg=principal, peak_nav_usdg=peak_nav, side=side,
+                exposure_pct=exposure_pct, oor_elapsed_seconds=oor_elapsed, policy=exit_policy)
+            if should_exit:
+                drawdown = (peak_nav - nav) / peak_nav * 100 if peak_nav > 0 else Decimal(0)
+                print(f'[mgr] EXIT {pos["symbol"]}: {exit_reason} nav=${float(nav):.4f} '
+                      f'drawdown={float(drawdown):.1f}% exposure={exposure_pct:.0f}%')
+                full_exit(key, dict(pos, _exit_reason=exit_reason))
+                # An upside break is a clean recycle, not a bad token: keep its cooldown
+                # short so capital can be redeployed instead of parked for a day.
+                recycle = exit_reason == 'out_of_range_above'
+                cooldown[key] = now_ts + (300 if recycle else cfg.TOKEN_COOLDOWN_HOURS*3600)
                 del positions[key]
-                fee_history.pop(str(tid), None)
-                cfg.ROTATION_REQUEST_FILE.unlink(missing_ok=True)
-                alerts.append(f'🔄 ROTATE {pos["symbol"]}: fee 3j ${float(fee_3h):.2f} < $2; kandidat {ready.get("symbol")} siap')
+                alerts.append(f'{"♻️" if recycle else "❌"} EXIT {pos["symbol"]} ({exit_reason}): '
+                              f'nav ${float(nav):.2f} vs principal ${float(principal):.2f}')
                 updated = True
                 continue
 
-        # HARVEST
-        if total_fees_usdg >= cfg.HARVEST_MIN_USDG:
-            print(f'[mgr] HARVEST {pos["symbol"]} fees=${float(total_fees_usdg):.2f}')
-            try:
-                r = collect_fees(tid)
-                print(f' collect tx: {r["hash"]} status={r["status"]}')
-                alerts.append(f'💰 HARVEST {pos["symbol"]} +${float(total_fees_usdg):.2f}')
-                pos['last_harvest_time'] = int(time.time())
-                pos['total_fees_collected_usdg'] = str(Decimal(pos.get('total_fees_collected_usdg','0')) + total_fees_usdg)
-                updated = True
-            except Exception as e:
-                print(f' collect fail: {e}')
+            # LOW-FEE ROTATION: request discovery first; close only after replacement
+            # independently passes GMGN, live quote, and round-trip safety validation.
+            if fee_3h is not None and fee_3h < cfg.MIN_FEE_3H_USDG:
+                request = {'ts': int(time.time()), 'token_id': tid, 'token': pos['token'],
+                           'symbol': pos['symbol'], 'fee_3h_usdg': str(fee_3h),
+                           'threshold_usdg': str(cfg.MIN_FEE_3H_USDG), 'status': 'searching'}
+                save_json(cfg.ROTATION_REQUEST_FILE, request)
+                ready = load_json(cfg.ROTATION_READY_FILE, {})
+                fresh=(ready.get('source_token_id') == tid and int(ready.get('validated_at',ready.get('ts',0))) <= time.time() < int(ready.get('expires_at',0)))
+                if fresh:
+                    from rotation import revalidate_ready, prepare_pending, update_pending
+                    # Size the replacement from this position's real committed capital.
+                    # The former get('entry_value_usdg', get('entry_value_usd', ...)) chain
+                    # named two V4-only keys, so every V3 record fell through to the config
+                    # constant and rotated at $1 no matter how large the position was.
+                    estimated_raw=int(lp_positions.principal_usdg(pos)*Decimal(10**cfg.USDG_DECIMALS))
+                    try:
+                        evidence=revalidate_ready(ready,pos,estimated_raw)
+                        # Mandatory before journal phase or source mutation: prove the deployed
+                        # executor can simulate immutable generic open calldata at the PONS/source estimate.
+                        if ready.get('target_version')=='v4':
+                            import atomic_v4_backend
+                            candidate_pool=ready.get('candidate_pool') or (ready.get('validation_evidence') or {}).get('pool') or {}
+                            pool_id=candidate_pool.get('poolId')
+                            if not pool_id:
+                                raise RuntimeError('rotation-ready V4 candidate missing poolId')
+                            evidence['atomic_open']=atomic_v4_backend.capability_preflight(ready['token'],estimated_raw,pool_id)
+                    except Exception as exc:
+                        print(f'[mgr] rotation retained: revalidation failed: {str(exc)[:160]}'); continue
+                    print(f'[mgr] ROTATE {pos["symbol"]}: fee3h=${float(fee_3h):.2f}; replacement={ready.get("symbol")}')
+                    pending=prepare_pending(ready,pos,evidence) if ready.get('target_version')=='v4' else None
+                    if pending:
+                        pending=update_pending(pending,'closing',wallet_usdg_before_raw=c.erc20_balance(cfg.USDG),source_token_before_raw=c.erc20_balance(pos['token']))
+                    try: result=settle_v3_rotation(pos)
+                    except Exception as exc:
+                        if pending:update_pending(pending,'liquidation_pending' if str(exc)=='liquidation_pending' else 'recovery',last_error=str(exc)[:300],recovery=getattr(exc,'recovery',{}))
+                        print('[mgr] rotation close incomplete; recovery retained'); continue
+                    if pending:update_pending(pending,'settled',settlement=result,exact_proceeds_raw=result['exact_proceeds_raw'],txs=result['txs'])
+                    cooldown[key] = int(time.time() + cfg.TOKEN_COOLDOWN_HOURS*3600)
+                    del positions[key]
+                    fee_history.pop(str(tid), None)
+                    cfg.ROTATION_REQUEST_FILE.unlink(missing_ok=True)
+                    alerts.append(f'🔄 ROTATE {pos["symbol"]}: fee 3j ${float(fee_3h):.2f} < $2; kandidat {ready.get("symbol")} siap')
+                    updated = True
+                    continue
+
+            # HARVEST
+            if total_fees_usdg >= cfg.HARVEST_MIN_USDG:
+                print(f'[mgr] HARVEST {pos["symbol"]} fees=${float(total_fees_usdg):.2f}')
+                try:
+                    r = collect_fees(tid)
+                    print(f' collect tx: {r["hash"]} status={r["status"]}')
+                    alerts.append(f'💰 HARVEST {pos["symbol"]} +${float(total_fees_usdg):.2f}')
+                    pos['last_harvest_time'] = int(time.time())
+                    pos['total_fees_collected_usdg'] = str(Decimal(pos.get('total_fees_collected_usdg','0')) + total_fees_usdg)
+                    updated = True
+                except Exception as e:
+                    print(f' collect fail: {e}')
+        except Exception as exc:
+            # A single unreadable or unreachable position must not starve
+            # monitoring of the others; the tick used to abort entirely.
+            print(f'[mgr] {pos.get("symbol", key)} skipped this tick: {str(exc)[:200]}', file=sys.stderr)
+            continue
 
     if updated:
         save_json(cfg.POSITIONS_FILE, positions)

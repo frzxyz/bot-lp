@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import common as c
 import config as cfg
 import risk as lp_risk
+import positions as lp_positions
 from entry import get_price_usdg_per_token
 from manager import full_exit, load_json, save_json
 from gmgn_risk import assess as gmgn_assess
@@ -41,8 +42,16 @@ def main():
                 continue
             hard = not risk.get('ok')
             value = Decimal(str(row.get('valueUsd', 0)))
-            entry = Decimal(pos.get('entry_value_usd', '0'))
-            if hard or (entry and value < entry * (Decimal(1)-cfg.STOP_LOSS_PCT/100)):
+            # Defaulting this to zero used to disable the value stop entirely for any
+            # record missing the key, because `entry and ...` is false at zero — the
+            # position silently kept only its GMGN protection.
+            try:
+                entry = lp_positions.principal_usdg(pos)
+            except lp_positions.MissingMoneyField as exc:
+                print(f'[v4-emergency] {pos.get("symbol", key)}: {exc}; value stop unavailable, '
+                      f'GMGN stop still active', file=sys.stderr)
+                entry = None
+            if hard or (entry is not None and entry > 0 and value < entry * (Decimal(1)-cfg.STOP_LOSS_PCT/100)):
                 try:
                     result = hybrid_v4.close_position(key, 'panic_gmgn' if hard else 'panic_value')
                     print('[v4-emergency] '+json.dumps(result))
@@ -74,7 +83,7 @@ def main():
         fast, fast_reason = lp_risk.dump_detected(
             h, now, window_seconds=cfg.FAST_DUMP_WINDOW_SECONDS,
             price_drop_pct=cfg.FAST_DUMP_PCT, liquidity_drop_pct=cfg.FAST_LIQ_DROP_PCT)
-        if fast:
+        if fast and fast_reason:
             window_min = cfg.FAST_DUMP_WINDOW_SECONDS // 60
             alerts.append(f'🚨 {fast_reason.upper()} {pos["symbol"]}: triggered within {window_min}m window')
             trigger = True
