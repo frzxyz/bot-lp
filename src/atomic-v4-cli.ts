@@ -5,6 +5,7 @@ import { ethers } from "ethers";
 import { provider, wallet } from "./chain/client.js";
 import { C, cfg, env } from "./config.js";
 import { kyberBuild, kyberRoute } from "./chain/kyber.js";
+import { KYBER_SIMPLE_SELECTOR, KYBER_SWAP_SELECTOR } from "./chain/kyberDecode.js";
 import { generateOpenPlan, generateInventoryOpenPlan, generateClosePlan } from "./atomic-v4-plan.js";
 const OWNER="0x3582605Edebf376b684a45E8Faa6D808C22a8e3e";
 const USDG="0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168";
@@ -49,5 +50,26 @@ async function executeOpen(token:string,budget:string,poolId?:string){
   return {receipt:{hash:r.hash,status:r.status,blockNumber:r.blockNumber,gasUsed:r.gasUsed,nonce},event:{name:"Opened",tokenId:String(tokenId),token:p.token,poolId:p.pool.poolId,usdgIn:ev.args.usdgIn,tokenOut:ev.args.tokenOut},tokenId:String(tokenId),poolId:p.pool.poolId,tickLower:p.meta.tickLower,tickUpper:p.meta.tickUpper,txHash:r.hash,swapHash:r.hash,nftOwner:owner,liquidity:liq,executorBalances:{usdg:u,token:t}};
  } finally {try{fs.unlinkSync(tmp)}catch{}}
 }
-async function main(){const [cmd,a,b,c,d,e]=process.argv.slice(2);if(cmd==="execute-open"&&a&&b)return json({ok:true,result:await executeOpen(a,b,c)});if(cmd==="execute-close"&&a)return json({ok:true,result:await executeClose(a)});if(cmd==="build-swap"&&a&&b&&c)return json({ok:true,result:await swapBuild(a,b,c)});if(cmd==="generate-open"&&a&&b&&c)return json({ok:true,result:await generateOpenPlan(a,BigInt(b),c,d?Number(d):500,8,e)});if(cmd==="generate-inventory-open"&&a)return json({ok:true,result:await generateInventoryOpenPlan(a,b?Number(b):500,c?Number(c):8)});if(cmd==="generate-close"&&a&&b)return json({ok:true,result:await generateClosePlan(a,b,c?Number(c):500)});if(cmd==="dry-open"&&a)return json({ok:true,result:await dry("open",a)});if(cmd==="dry-close"&&a)return json({ok:true,result:await dry("close",a)});throw Error("commands: execute-close TOKEN_ID | generate-open BUDGET_RAW OUT.json [SLIPPAGE_BPS] | generate-inventory-open OUT.json [SLIPPAGE_BPS] [WIDTH_SPACINGS] | generate-close TOKEN_ID OUT.json [SLIPPAGE_BPS] | build-swap TOKEN_IN TOKEN_OUT AMOUNT_RAW | dry-open PLAN.json | dry-close PLAN.json");}
+/**
+ * Read-only executor introspection. Reports mismatches instead of throwing, so a
+ * readiness check can show every unmet precondition at once rather than stopping
+ * at the first. Moves nothing and signs nothing.
+ */
+async function status(){
+  const addr=process.env.ATOMIC_V4_EXECUTOR_ADDRESS;if(!addr)throw Error("ATOMIC_V4_EXECUTOR_ADDRESS required");
+  const net=await provider.getNetwork();const e=new ethers.Contract(addr,ABI,provider);
+  const [owner,usdg,posm,swapTarget,paused,code]=await Promise.all([
+    e.owner(),e.USDG(),e.POSITION_MANAGER(),e.SWAP_TARGET(),e.paused(),provider.getCode(addr)]);
+  const selectors:Record<string,boolean>={};
+  for(const sel of [KYBER_SWAP_SELECTOR,KYBER_SIMPLE_SELECTOR]) selectors[sel]=await e.swapSelectorAllowed(sel);
+  const eq=(x:string,y:string)=>{try{return ethers.getAddress(x)===ethers.getAddress(y)}catch{return false}};
+  return {executor:addr,deployed:code!=="0x",chainId:Number(net.chainId),chainOk:net.chainId===4663n,
+    owner,ownerOk:eq(owner,OWNER),usdg,usdgOk:eq(usdg,USDG),
+    positionManager:posm,positionManagerOk:eq(posm,C.v4PositionManager!),
+    swapTarget,swapTargetOk:eq(swapTarget,env.kyberRouter),
+    paused,swapSelectorAllowed:selectors,
+    // Any allowlisted entrypoint is enough; the plan builder proves which one it used.
+    selectorReady:Object.values(selectors).some(Boolean)};
+}
+async function main(){const [cmd,a,b,c,d,e]=process.argv.slice(2);if(cmd==="status")return json({ok:true,result:await status()});if(cmd==="execute-open"&&a&&b)return json({ok:true,result:await executeOpen(a,b,c)});if(cmd==="execute-close"&&a)return json({ok:true,result:await executeClose(a)});if(cmd==="build-swap"&&a&&b&&c)return json({ok:true,result:await swapBuild(a,b,c)});if(cmd==="generate-open"&&a&&b&&c)return json({ok:true,result:await generateOpenPlan(a,BigInt(b),c,d?Number(d):500,8,e)});if(cmd==="generate-inventory-open"&&a)return json({ok:true,result:await generateInventoryOpenPlan(a,b?Number(b):500,c?Number(c):8)});if(cmd==="generate-close"&&a&&b)return json({ok:true,result:await generateClosePlan(a,b,c?Number(c):500)});if(cmd==="dry-open"&&a)return json({ok:true,result:await dry("open",a)});if(cmd==="dry-close"&&a)return json({ok:true,result:await dry("close",a)});throw Error("commands: status | execute-close TOKEN_ID | generate-open BUDGET_RAW OUT.json [SLIPPAGE_BPS] | generate-inventory-open OUT.json [SLIPPAGE_BPS] [WIDTH_SPACINGS] | generate-close TOKEN_ID OUT.json [SLIPPAGE_BPS] | build-swap TOKEN_IN TOKEN_OUT AMOUNT_RAW | dry-open PLAN.json | dry-close PLAN.json");}
 main().catch(e=>{console.error(JSON.stringify({ok:false,error:String(e.message||e).slice(0,500)}));process.exit(1)});

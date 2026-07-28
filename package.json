@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:py": "python3 -m mypy --config-file mypy.ini",
     "test:py": "cd automation && python3 -m unittest discover -p 'test_*.py'",
+    "v4:check": "cd automation && python3 v4_certify.py",
     "build": "tsc",
     "test:safety": "node --import tsx --test test/v4-safety.test.ts test/v4-settlement.test.ts",
     "test:atomic-v4-plan": "node --import tsx --test test/atomic-v4-plan.test.ts",
