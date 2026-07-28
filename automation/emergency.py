@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import common as c
 import config as cfg
+import risk as lp_risk
 from entry import get_price_usdg_per_token
 from manager import full_exit, load_json, save_json
 from gmgn_risk import assess as gmgn_assess
@@ -66,6 +67,17 @@ def main():
         h.append({'t': now, 'price': str(price), 'usdg_pool': usdg_in_pool})
         # keep only last 90 min
         h[:] = [x for x in h if now - x['t'] <= 5400]
+        trigger = False
+        # Short-window check first. The 1h baseline below needs a sample at least 55
+        # minutes old, which leaves a freshly minted position completely unguarded
+        # through the window where a new memecoin is most likely to be dumped.
+        fast, fast_reason = lp_risk.dump_detected(
+            h, now, window_seconds=cfg.FAST_DUMP_WINDOW_SECONDS,
+            price_drop_pct=cfg.FAST_DUMP_PCT, liquidity_drop_pct=cfg.FAST_LIQ_DROP_PCT)
+        if fast:
+            window_min = cfg.FAST_DUMP_WINDOW_SECONDS // 60
+            alerts.append(f'🚨 {fast_reason.upper()} {pos["symbol"]}: triggered within {window_min}m window')
+            trigger = True
         # find datapoint ~1h ago (closest)
         past = [x for x in h if now - x['t'] >= 3600 - 300 and now - x['t'] <= 3600 + 900]
         if past:
@@ -74,25 +86,24 @@ def main():
             liq_1h_ago = int(p1h['usdg_pool'])
             price_change = (price - price_1h_ago) / price_1h_ago * Decimal(100) if price_1h_ago > 0 else Decimal(0)
             liq_change_pct = Decimal(liq_1h_ago - usdg_in_pool) / Decimal(liq_1h_ago) * Decimal(100) if liq_1h_ago > 0 else Decimal(0)
-            trigger = False
             if price_change < -cfg.DUMP_PCT_1H:
                 alerts.append(f'🚨 DUMP {pos["symbol"]}: {float(price_change):.1f}% in 1h')
                 trigger = True
             if liq_change_pct > cfg.RUG_LIQ_DROP_PCT_1H:
                 alerts.append(f'🚨 RUG {pos["symbol"]}: pool USDG -{float(liq_change_pct):.1f}% in 1h')
                 trigger = True
-            if trigger:
-                print(f'[emrg] PANIC EXIT {pos["symbol"]}')
-                try:
-                    full_exit(key, dict(pos,_emergency=True,_exit_reason='emergency_exit'))
-                    del positions[key]
-                    cooldown[key] = now + cfg.TOKEN_COOLDOWN_HOURS*3600
-                    updated = True
-                except Exception as e:
-                    print(f'[emrg] exit failed: {e}')
-                    # if exit fails, arm kill-switch so we don't keep trying
-                    cfg.KILL_SWITCH.parent.mkdir(parents=True, exist_ok=True)
-                    cfg.KILL_SWITCH.write_text(f'exit_fail {pos["symbol"]} at {now}: {e}')
+        if trigger:
+            print(f'[emrg] PANIC EXIT {pos["symbol"]}')
+            try:
+                full_exit(key, dict(pos,_emergency=True,_exit_reason='emergency_exit'))
+                del positions[key]
+                cooldown[key] = now + cfg.TOKEN_COOLDOWN_HOURS*3600
+                updated = True
+            except Exception as e:
+                print(f'[emrg] exit failed: {e}')
+                # if exit fails, arm kill-switch so we don't keep trying
+                cfg.KILL_SWITCH.parent.mkdir(parents=True, exist_ok=True)
+                cfg.KILL_SWITCH.write_text(f'exit_fail {pos["symbol"]} at {now}: {e}')
     if updated:
         save_json(cfg.POSITIONS_FILE, positions)
         save_json(cfg.COOLDOWN_FILE, cooldown)

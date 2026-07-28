@@ -181,7 +181,39 @@ radar LLM+GMGN · auto-LP dengan cap (ukuran/jumlah/harian) + hard-filter.
 
 ---
 
-## 6. Catatan operasional
+## 6. Risk engine (`automation/risk.py`)
+
+Semua math LP (IL, NAV, lebar range, volatilitas, keputusan exit) ada di satu modul
+murni tanpa side-effect, biar bisa diuji offline. Dipakai `manager`, `emergency`,
+`hybrid_v4`, `scanner`, dan `entry`.
+
+**Asimetri range — ini inti perbaikannya.** Di pool USDG/TOKEN, tembus ke **bawah**
+range = posisi jadi 100% memecoin (bahaya, exit cepat). Tembus ke **atas** = posisi
+jadi 100% USDG (nol risiko token, nggak perlu bayar gas buat buru-buru keluar).
+Sebelumnya kedua sisi diperlakukan sama dengan timer 2 jam.
+
+| Env | Default | Fungsi |
+|---|---|---|
+| `RH_OOR_BELOW_MAX_SECONDS` | `900` | Batas nahan posisi yang jatuh ke bawah range |
+| `RH_OOR_ABOVE_MAX_SECONDS` | `21600` | Batas posisi di atas range (aman, cuma nganggur) |
+| `RH_MAX_DRAWDOWN_PCT` | `12` | Trailing stop dari **puncak NAV**, bukan dari harga entry |
+| `RH_MAX_TOKEN_EXPOSURE_PCT` | `92` | Exit kalau posisi udah nyaris seluruhnya jadi token |
+| `RH_FAST_DUMP_WINDOW_SECONDS` | `600` | Jendela deteksi dump cepat (nutup blind spot 1 jam pertama) |
+| `RH_FAST_DUMP_PCT` / `RH_FAST_LIQ_DROP_PCT` | `15` / `20` | Ambang dump / tarikan likuiditas di jendela itu |
+| `RH_RANGE_SIGMAS` | `2` | Lebar range = sigma × vol × √horizon |
+| `RH_RANGE_HORIZON_HOURS` | `6` | Horizon yang dipakai buat sizing range |
+| `RH_RANGE_MIN_PCT` / `RH_RANGE_MAX_PCT` | `15` / `80` | Batas bawah/atas lebar range |
+| `RH_ENTRY_EDGE_MARGIN` | `1.5` | Fee harus ≥ margin × (IL + biaya round-trip) |
+| `RH_LP_RANGE_PCT` | `50` | Lebar cadangan kalau volatilitas belum keukur |
+
+Lebar range sekarang **benar-benar sampai ke executor**: `ATOMIC_RANGE_PCT` (V3) dan
+`RH_V4_RANGE_PCT` (V4) diisi dari volatilitas terukur. Sebelumnya V3 selalu pakai
+default env `20`, dan V4 selalu 8 tick-spacing — argumen `width` dibuang diam-diam.
+
+Entry sekarang fail-closed secara ekonomi: kandidat yang fee proyeksinya nggak bisa
+nutup IL + biaya round-trip ditolak (`lp_edge_ok`), sekencang apa pun momentumnya.
+
+## 7. Catatan operasional
 - **Fee tier**: v3 mentok 1%; farming fee-tinggi (3-25%) ada di **v4** (pair native ETH).
 - **Wallet**: pakai burner. Kalau share sama bot lain yang jalan bareng → risiko nonce-conflict.
 - **`/pnl`**: berat kalau wallet punya banyak history tx (di-cache 2 menit).

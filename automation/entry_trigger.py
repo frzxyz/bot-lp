@@ -89,6 +89,12 @@ def main():
         if not c_.get('has_direct_usdg'): continue
         if Decimal(str(c_.get('liq_usd', '0'))) < cfg.MIN_LIQ_USD: continue
         if Decimal(str(c_.get('age_hours', c_.get('age_h', 0)))) < cfg.MIN_AGE_HOURS: continue
+        # Fail closed on economics: a pool whose modelled fees cannot cover its own
+        # adverse impermanent loss plus round-trip cost is a losing position taken
+        # at full risk, no matter how strong its momentum looks.
+        if not c_.get('lp_edge_ok'):
+            print(f'[trig] {c_["symbol"]} no LP edge: {c_.get("lp_edge")}; skip')
+            continue
         if c_.get('preferred_venue') == 'v4' and not c_.get('has_direct_usdg_v3'):
             if not hybrid_v4.lifecycle_verified():
                 print(f'[trig] {c_["symbol"]} V4 lifecycle marker absent or invalid', file=sys.stderr)

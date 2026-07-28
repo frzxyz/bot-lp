@@ -17,8 +17,9 @@ class RebalanceTest(unittest.TestCase):
   self.paths.start(); h.save({TOKEN.lower():dict(OLD)}); h.save_pending({})
   h.cfg.V4_LIFECYCLE_MARKER.write_text('{"passed":true,"chain_id":4663,"wallet":"'+h.cfg.WALLET_ADDRESS+'","post_close_open":false,"mint_tx":"a","collect_tx":"b","close_tx":"c"}')
   self.gates=patch.multiple(h.c,check_kill=lambda:None,erc20_balance=lambda _:int(self.available*1_000_000),eth_balance=lambda:10**18,get_gas_price=lambda:{},check_pending_nonce=lambda:1)
-  self.backend=patch.multiple(h.v4,close_usdg=lambda _:close(24),reverse_preflight=lambda *_,**__:{'executable':True,'minOutRaw':'1'},discover=lambda _:[{}],quote=lambda *_:[{'eligible':True,'amountOut':1}],route_preflight=lambda *_:{},open_usdg_kyber=lambda _,raw:self.raw.append(raw) or OPEN)
-  self.atomic_open=patch.object(h.atomic_v4,'open_position',side_effect=lambda _,raw:self.raw.append(raw) or OPEN)
+  self.backend=patch.multiple(h.v4,close_usdg=lambda _:close(24),reverse_preflight=lambda *_,**__:{'executable':True,'minOutRaw':'1'},discover=lambda _:[{}],quote=lambda *_:[{'eligible':True,'amountOut':1}],route_preflight=lambda *_:{},open_usdg_kyber=lambda _,raw,*a:self.raw.append(raw) or OPEN)
+  self.widths=[]
+  self.atomic_open=patch.object(h.atomic_v4,'open_position',side_effect=lambda _,raw,width_pct=None,**kw:(self.raw.append(raw),self.widths.append(width_pct)) and OPEN or OPEN)
   self.gates.start(); self.backend.start(); self.atomic_open.start(); self.risk=patch.object(h,'gmgn_assess',return_value={'ok':True,'hard_stop':False}); self.risk.start()
  def tearDown(self):
   self.risk.stop(); self.atomic_open.stop(); self.backend.stop(); self.gates.stop(); self.paths.stop(); self.env.stop(); self.t.cleanup()
@@ -43,6 +44,13 @@ class RebalanceTest(unittest.TestCase):
   bad={'nftGone':True,'settlementComplete':True}
   with patch.object(h.atomic_v4,'close_position',return_value=bad): out=h.rebalance(TOKEN.lower(),dict(OLD),now=100)
   self.assertFalse(self.raw); self.assertIsNone(h.load_pending()[TOKEN.lower()]['isolated_budget_usdg']); self.assertIn('missing',out['error'])
+ def test_reopen_forwards_the_range_width(self):
+  """The width used to be computed and then silently dropped at the executor call."""
+  self.run_close(24); self.assertEqual(self.widths,[int(h.cfg.RANGE_PCT)])
+ def test_reopen_uses_recorded_width_when_present(self):
+  with patch.object(h.atomic_v4,'close_position',return_value=close(24)):
+   h.rebalance(TOKEN.lower(),dict(OLD),now=100,range_width=37)
+  self.assertEqual(self.widths,[37])
  def test_close_incomplete_retains_old(self):
   with patch.object(h.atomic_v4,'close_position',return_value={'nftGone':True,'settlementComplete':False}): h.rebalance(TOKEN.lower(),dict(OLD),now=100)
   self.assertIn(TOKEN.lower(),h.load()); self.assertEqual(h.load_pending(),{})

@@ -2,6 +2,7 @@
 import json, math, time
 from decimal import Decimal
 import config as cfg
+import risk as lp_risk
 
 def tick_distance(tick, lower, upper):
     """Return (outside %, class, edge-warning % or None). Percent is orientation neutral."""
@@ -30,8 +31,9 @@ def metrics(rows, now=None):
         if not old:return None
         return (1.0001**(spot-int(old[-1]['tick']))-1)*100
     recent=[r for r in valid if float(r['timestamp'])>=now-3600]
-    deltas=[int(b['tick'])-int(a['tick']) for a,b in zip(recent,recent[1:])]
-    vol=(math.sqrt(sum(d*d for d in deltas)/len(deltas)) if deltas else 0)*math.log(1.0001)*100
+    # Per-sample tick dispersion silently rescales with the scheduler's polling
+    # interval, so a skipped tick used to read as a volatility spike.
+    vol=lp_risk.realized_vol_pct_per_hour(recent,now) or 0.0
     # Robust sample-mean tick (trim one each side with >=5 samples); labelled local, not an oracle.
     ts=sorted(int(r['tick']) for r in recent)
     if len(ts)>=5: ts=ts[1:-1]

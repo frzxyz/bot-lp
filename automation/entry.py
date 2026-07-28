@@ -29,6 +29,20 @@ def find_pool(token):
                     return p, fee
     raise RuntimeError('no active USDG pool')
 
+def entry_width(token):
+    """Half-width in percent for a new position, from the scanner's measurement.
+
+    Falls back to the configured width when the scanner has no volatility reading,
+    which is the wider and therefore safer choice.
+    """
+    try:
+        cands = json.loads(cfg.CANDIDATES_FILE.read_text()).get('candidates', [])
+        match = next(x for x in cands if str(x.get('token','')).lower() == token.lower())
+        width = match.get('suggested_width_pct')
+    except Exception:
+        width = None
+    return int(round(width if width else float(cfg.RANGE_PCT)))
+
 def compute_ticks(pool, range_pct):
     s0 = c.pool_slot0(pool)
     tick = int(s0[1])
@@ -116,7 +130,9 @@ def main():
     # Atomic-only production path: one executor transaction, then persist only its receipt.
     if cfg.ATOMIC_LP_ONLY:
         import atomic_v3_backend as atomic
-        result=atomic.open_position(token,need_usdg)
+        width=entry_width(token)
+        print(f'[entry] range half-width {width}% (volatility-matched)')
+        result=atomic.open_position(token,need_usdg,width_pct=width)
         ev=result.get('event') or {}; p=result.get('params') or {}; q=result.get('quote') or {}; rc=result['receipt']
         token_id=int(ev['tokenId']); pool=p['expectedPool']; fee=int(p['fee'])
         tick_lower,tick_upper=int(p['tickLower']),int(p['tickUpper'])

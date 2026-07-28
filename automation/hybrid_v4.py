@@ -7,6 +7,7 @@ import v4_backend as v4
 import adaptive_v4 as policy
 import v4_close_wal as close_wal
 import lifecycle
+import risk as lp_risk
 import atomic_v4_backend as atomic_v4
 from gmgn_risk import assess as gmgn_assess
 
@@ -48,6 +49,17 @@ def _prepare_close(pos,reason,emergency_full_close=False):
     return close_wal.begin(pos,reason,c.erc20_balance(pos['token']),c.erc20_balance(cfg.USDG),
       (1,predicted),pos.get('pool_key',{'poolId':pos.get('poolId')}),[proof],proof,
       emergency_full_close=emergency_full_close)
+
+def entry_width(token,history=None,now=None):
+    """Half-width in percent, sized from the token's own measured volatility.
+
+    Falls back to the configured width when there is no usable tick history, which
+    is deliberately the wider option: an unmeasured token gets a safer range rather
+    than the tightest one.
+    """
+    rows=load_history().get(str(token).lower(),[]) if history is None else history
+    width=lp_risk.width_pct_for_vol(lp_risk.realized_vol_pct_per_hour(rows,now))
+    return int(round(width if width is not None else float(cfg.RANGE_PCT)))
 
 def lifecycle_verified():
     m=_json(cfg.V4_LIFECYCLE_MARKER,{})
@@ -98,9 +110,8 @@ def _reopen(rec,dry_run=False,now=None):
     if not quotes: raise RuntimeError('no live V4 quote')
     v4.route_preflight(rec['token'],raw)
     if dry_run: return {'dry_run':True,'action':'reopen','token':rec['token'],'amount_usdg':str(amount)}
-    width=int(rec.get('range_width_percent',25))
-    try: result=atomic_v4.open_position(rec['token'],raw) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(rec['token'],raw,width)
-    except TypeError: result=atomic_v4.open_position(rec['token'],raw) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(rec['token'],raw) # older/mock backend compatibility
+    width=int(rec.get('range_width_percent',cfg.RANGE_PCT))
+    result=atomic_v4.open_position(rec['token'],raw,width_pct=width) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(rec['token'],raw,width)
     key=rec['token'].lower(); positions=load()
     reserve=proceeds-amount
     positions[key]={'version':'v4','token':rec['token'],'symbol':rec.get('symbol','?'),'token_id':str(result['tokenId']),'poolId':result.get('poolId'),'tick_lower':result.get('tickLower'),'tick_upper':result.get('tickUpper'),'mint_tx':result.get('txHash'),'swap_tx':result.get('swapHash'),'mint_time':now,'entry_value_usd':str(amount),'principal_usdg':rec['principal_usdg'],'last_realized_usdg':rec['last_realized_usdg'],'cumulative_realized_profit_usdg':rec['cumulative_realized_profit_usdg'],'compounded_capital_usdg':str(amount),'isolated_strategy_reserve_usdg':str(reserve),'peak_capital_usdg':rec['peak_capital_usdg'],'last_fee_usd':'0','fee_baseline_ts':now,'rebalance_count':int(rec.get('rebalance_count',1)),'rebalanced_from_token_id':rec.get('closed_token_id'),'rebalanced_at':now,'rebalance_cooldown_until':now+cfg.V4_REBALANCE_COOLDOWN_SECONDS,'range_width_percent':width,'range_mode':rec.get('range_mode','normal')}
@@ -110,8 +121,9 @@ def _failure(key,rec,exc,now):
     allp=load_pending(); rec=allp.get(key,rec); rec['attempt_count']=int(rec.get('attempt_count',0))+1; rec['last_error']=str(exc)[:300]; rec['next_retry']=now+cfg.V4_REBALANCE_RETRY_SECONDS; allp[key]=rec; save_pending(allp)
     return {'token':key,'error':rec['last_error'],'action':'rebalance_pending'}
 
-def rebalance(key,pos,dry_run=False,now=None,reopen_fraction=Decimal('1'),range_width=25,range_mode='normal'):
+def rebalance(key,pos,dry_run=False,now=None,reopen_fraction=Decimal('1'),range_width=None,range_mode='normal'):
     now=int(time.time() if now is None else now)
+    range_width=int(range_width) if range_width else entry_width(pos['token'],now=now)
     if dry_run: return {'dry_run':True,'action':'rebalance','reason':'out_of_range','token_id':pos['token_id'],'token':pos['token'],'budget':'exact verified close proceeds (unknown until close)','compound_cap':str(cfg.V4_COMPOUND_MAX_USDG),'plan':['close_usdg','verify exact isolated proceeds','live safety gates','open_usdg_kyber']}
     lifecycle.assert_new_strategy_allowed('v4')
     _prepare_close(pos,'out_of_range')
@@ -135,7 +147,7 @@ def deep_exit(key,pos,now,dry_run=False,hard_stop=False):
     if not can_delete(result):return {'error':'V4 close incomplete; old state retained','close':result}
     proceeds=_proceeds_usdg(result); positions=load(); positions.pop(key,None); save(positions)
     width,mode=policy.range_width(policy.metrics(load_history().get(key,[]),now).get('realized_vol_1h_pct'))
-    rec=_make_pending(pos,'deep_oor',now,proceeds); rec.update(earliest_retry=now+(24*3600 if hard_stop else cfg.V4_REENTRY_DELAY_SECONDS),expires_at=now+cfg.V4_REENTRY_EXPIRY_SECONDS,reopen_fraction='1',range_width_percent=width or 50,range_mode=mode or 'extreme',hard_stop=hard_stop,exact_close_proceeds_usdg=str(proceeds))
+    rec=_make_pending(pos,'deep_oor',now,proceeds); rec.update(earliest_retry=now+(24*3600 if hard_stop else cfg.V4_REENTRY_DELAY_SECONDS),expires_at=now+cfg.V4_REENTRY_EXPIRY_SECONDS,reopen_fraction='1',range_width_percent=width or int(cfg.RANGE_PCT),range_mode=mode or 'extreme',hard_stop=hard_stop,exact_close_proceeds_usdg=str(proceeds))
     p=load_pending(); p.pop(key,None); save_pending(p); q=load_reentry(); q[key]=rec; save_reentry(q)
     return {'action':'deep_exit_usdg','proceeds_usdg':str(proceeds),'reopen':False}
 
@@ -194,7 +206,8 @@ def enter(cand,dry_run=None):
     if amount<=0: raise RuntimeError('USDG reserve leaves no budget')
     v4.route_preflight(cand['token'],int(amount*10**cfg.USDG_DECIMALS))
     if dry_run if dry_run is not None else cfg.DRY_RUN: return {'dry_run':True,'amount_usdg':str(amount)}
-    result=atomic_v4.open_position(cand['token'],int(amount*10**cfg.USDG_DECIMALS)) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(cand['token'],int(amount*10**cfg.USDG_DECIMALS)); now=int(time.time()); key=cand['token'].lower(); positions=load()
+    width=entry_width(cand['token'])
+    result=atomic_v4.open_position(cand['token'],int(amount*10**cfg.USDG_DECIMALS),width_pct=width) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(cand['token'],int(amount*10**cfg.USDG_DECIMALS)); now=int(time.time()); key=cand['token'].lower(); positions=load()
     positions[key]={'version':'v4','token':cand['token'],'symbol':cand.get('symbol','?'),'token_id':str(result['tokenId']),'poolId':result.get('poolId'),'tick_lower':result.get('tickLower'),'tick_upper':result.get('tickUpper'),'mint_tx':result.get('txHash'),'swap_tx':result.get('swapHash'),'mint_time':now,'entry_value_usd':str(amount),'principal_usdg':str(amount),'last_realized_usdg':'0','cumulative_realized_profit_usdg':'0','compounded_capital_usdg':str(amount),'peak_capital_usdg':str(amount),'rebalance_count':0,'last_fee_usd':'0','fee_baseline_ts':now}; save(positions); return result
 
 def enter_isolated_rotation(cand,exact_budget_raw,source,dry_run=False,now=None):
@@ -214,11 +227,12 @@ def enter_isolated_rotation(cand,exact_budget_raw,source,dry_run=False,now=None)
     quotes=[q for q in v4.quote(cand['token'],raw) if q.get('eligible') and int(q.get('amountOut',0))>0]
     if not quotes: raise RuntimeError('no exact-size live quote')
     v4.route_preflight(cand['token'],raw); c.get_gas_price(); c.check_pending_nonce()
-    history=load_history().get(cand['token'].lower(),[]); width=25; mode='normal'
+    history=load_history().get(cand['token'].lower(),[]); mode='normal'
+    width=entry_width(cand['token'],history,now)
     if history:
-        width,mode=policy.range_width(policy.metrics(history,now).get('realized_vol_1h_pct')); width=width or 25
+        mode=policy.range_width(policy.metrics(history,now).get('realized_vol_1h_pct'))[1] or 'normal'
     if dry_run:return {'dry_run':True,'budget_raw':raw,'width':width}
-    result=atomic_v4.open_position(cand['token'],raw) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(cand['token'],raw,width)
+    result=atomic_v4.open_position(cand['token'],raw,width_pct=width) if cfg.ATOMIC_LP_ONLY else v4.open_usdg_kyber(cand['token'],raw,width)
     if not result.get('tokenId') or not result.get('txHash'): raise RuntimeError('mint closure evidence missing')
     amount=Decimal(raw)/Decimal(10**cfg.USDG_DECIMALS); reserve_rem=Decimal(exact-raw)/Decimal(10**cfg.USDG_DECIMALS)
     key=cand['token'].lower(); positions=load()
@@ -334,7 +348,11 @@ def manage(dry_run=None):
             if predicted>0: pos['expected_close_token_raw']=predicted
         except Exception:
             pass
+        peak=max(Decimal(str(pos.get('peak_nav_usdg',0))),value); pos['peak_nav_usdg']=str(peak)
         if entry and value<entry*(Decimal(1)-cfg.STOP_LOSS_PCT/100): reason='stop_loss'
+        # A position that round-trips a large gain back to break-even shows no loss
+        # against entry, so an entry-anchored stop alone never fires on it.
+        elif peak>0 and value<=peak*(Decimal(1)-cfg.MAX_DRAWDOWN_PCT/100): reason='nav_drawdown'
         risk=gmgn_assess(pos['token'],force=True); liquidity=row.get('liquidity'); source='stateview'
         if liquidity is None: liquidity=risk.get('liquidity_usd',risk.get('liquidity')); source='gmgn'
         tick=row.get('tick',row.get('currentTick'))
@@ -347,6 +365,19 @@ def manage(dry_run=None):
         if tick is not None and pos.get('tick_lower') is not None and pos.get('tick_upper') is not None:
             distance,klass,edge=policy.tick_distance(tick,pos['tick_lower'],pos['tick_upper']); elapsed=policy.continuous_timer(pos,klass,now)
             m=policy.metrics(hist,now); width,mode=policy.range_width(m.get('realized_vol_1h_pct')); blocked=[]; allowed=False
+            # Guessing the ordering would invert the sides, so an unidentifiable pair
+            # simply keeps the existing symmetric handling instead.
+            sym0,sym1=str(row.get('sym0','')).upper(),str(row.get('sym1','')).upper()
+            side=None
+            if 'USDG' in (sym0,sym1) and sym0!=sym1:
+                side=lp_risk.range_side(tick=tick,tick_lower=pos['tick_lower'],tick_upper=pos['tick_upper'],
+                                     token_is_token0=sym0!='USDG')
+            # Breaking below the range converts the position into 100% of a falling
+            # memecoin. Under stable-first the shallow/medium branches only ever
+            # block, so without this the position would hold that bag indefinitely.
+            if side==lp_risk.BELOW and klass!='in_range' and elapsed>=cfg.OOR_BELOW_MAX_SECONDS:
+                policy.log_decision({'timestamp':now,'token':key,'tick':tick,'classification':klass,'side':side,'elapsed':elapsed,'allowed':True,'blocked':[],'reason':'token_heavy_exit'})
+                actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN)); continue
             if klass!='in_range' and now<int(pos.get('rebalance_cooldown_until',0)): blocked=['cooldown']
             elif klass in ('shallow','medium'):
                 if cfg.STRATEGY_MODE == 'stable_first_exit':
@@ -360,7 +391,7 @@ def manage(dry_run=None):
                             raw=int(value*10**cfg.USDG_DECIMALS); pf=v4.route_preflight(pos['token'],raw); cost=policy.execution_cost_from_preflight(raw,pf,cfg.USDG_DECIMALS)
                         except Exception: pass
                         econ,_=policy.economics(hist,cost); allowed,blocked=policy.evidence_gates(klass,m,risk,econ)
-                        if allowed: actions.append(rebalance(key,dict(pos),dry_run if dry_run is not None else cfg.DRY_RUN,now,Decimal('.75') if klass=='medium' else Decimal('1'),width or 25,mode or 'normal')); continue
+                        if allowed: actions.append(rebalance(key,dict(pos),dry_run if dry_run is not None else cfg.DRY_RUN,now,Decimal('.75') if klass=='medium' else Decimal('1'),width,mode or 'normal')); continue
             elif klass=='deep':
                 if elapsed<cfg.V4_DEEP_CONFIRM_SECONDS: blocked=['deep_confirmation']
                 elif not risk.get('ok') or risk.get('hard_stop'): allowed=True; actions.append(deep_exit(key,dict(pos),int(now),dry_run if dry_run is not None else cfg.DRY_RUN,True)); continue
