@@ -6,6 +6,7 @@ import v4sdk from "@uniswap/v4-sdk";
 import { provider } from "./chain/client.js";
 import { C, cfg, env } from "./config.js";
 import { kyberBuild, kyberRoute } from "./chain/kyber.js";
+import { assertKyberCalldata } from "./chain/kyberDecode.js";
 import { discoverV4UsdgPools } from "./chain/v4/discover.js";
 import { tokenMeta } from "./chain/tokens.js";
 
@@ -27,7 +28,15 @@ async function kyber(tokenIn:string,tokenOut:string,amount:bigint,slippageBps:nu
   const built=await kyberBuild(route.routeSummary,EXECUTOR,EXECUTOR,slippageBps); if(!built)throw Error("Kyber build unavailable");
   if(ethers.getAddress(built.routerAddress)!==ethers.getAddress(env.kyberRouter))throw Error("Kyber router mismatch");
   if(BigInt(built.amountIn)!==amount)throw Error("Kyber changed exact input");
-  return { data:built.data as string, out:strict(BigInt(built.amountOut),"Kyber output"), quoted:BigInt(route.routeSummary.amountOut) };
+  // Asking for an executor-targeted build is not the same as getting one. The
+  // executor swaps as itself and measures its own balance delta, so calldata that
+  // delivers anywhere else fails its slippage check after the funds have already
+  // moved. Decode and prove the descriptor before it can reach a plan file.
+  const quoted=BigInt(route.routeSummary.amountOut);
+  const decoded=assertKyberCalldata(built.data as string,{
+    tokenIn,tokenOut,recipient:EXECUTOR,amountIn:amount,minAmountOut:floor(quoted,slippageBps)});
+  return { data:built.data as string, out:strict(BigInt(built.amountOut),"Kyber output"), quoted,
+           decoded:{selector:decoded.selector,dstReceiver:decoded.dstReceiver,minReturnAmount:String(decoded.minReturnAmount)} };
 }
 export function selectEligiblePool(pools:any[],requestedPoolId?:string){
   const eligible=pools.filter(p=>p.liquidity>0n&&p.tickSpacing>0&&poolId(p.poolKey).toLowerCase()===p.poolId.toLowerCase());
@@ -77,7 +86,7 @@ export async function generateOpenPlan(token:string,budget:bigint,outFile:string
   const call=V4PositionManager.addCallParameters(position,{recipient:OWNER,slippageTolerance:slip,deadline:String(deadline)});
   if(BigInt(call.value||0)!==0n)throw Error("ERC20 mint unexpectedly has native value");
   const amount0Min=strict(floor(BigInt(position.amount0.quotient.toString()),slippageBps),"amount0Min"), amount1Min=strict(floor(BigInt(position.amount1.quotient.toString()),slippageBps),"amount1Min");
-  const plan={token:candidate,pool:{...p.poolKey,poolId:p.poolId},usdgAmount:String(budget),swapAmount:String(swapAmount),minTokenOut:String(floor(k.out,slippageBps)),amount0Min:String(amount0Min),amount1Min:String(amount1Min),deadline,swapTarget:env.kyberRouter,swapData:k.data,mintData:call.calldata,meta:{chainId:4663,executor:EXECUTOR,payer:EXECUTOR,nftRecipient:OWNER,walletInventoryUsed:false,selection:"discovered-usdg-highest-liquidity",currentTick:p.tick,tickLower,tickUpper,sqrtPriceX96:String(p.sqrtPriceX96),quotedTokenOut:String(k.quoted),builtTokenOut:String(k.out),generatedAt:new Date().toISOString()}};
+  const plan={token:candidate,pool:{...p.poolKey,poolId:p.poolId},usdgAmount:String(budget),swapAmount:String(swapAmount),minTokenOut:String(floor(k.out,slippageBps)),amount0Min:String(amount0Min),amount1Min:String(amount1Min),deadline,swapTarget:env.kyberRouter,swapData:k.data,mintData:call.calldata,meta:{chainId:4663,executor:EXECUTOR,payer:EXECUTOR,nftRecipient:OWNER,walletInventoryUsed:false,selection:"discovered-usdg-highest-liquidity",currentTick:p.tick,tickLower,tickUpper,sqrtPriceX96:String(p.sqrtPriceX96),quotedTokenOut:String(k.quoted),builtTokenOut:String(k.out),swapProof:k.decoded,generatedAt:new Date().toISOString()}};
   fs.mkdirSync(path.dirname(outFile),{recursive:true});fs.writeFileSync(outFile,JSON.stringify(plan,null,2)+"\n");return plan;
 }
 export async function generateInventoryOpenPlan(outFile:string,slippageBps=500,widthSpacings=8){

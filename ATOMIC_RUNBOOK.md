@@ -11,7 +11,18 @@
 ## Support decision
 V3 is implemented atomically using the deployed deadline router: exact USDG pull -> exact-input swap -> mint-to-owner -> dust refund, or approved NFT decrease/collect-to-executor -> swap collected token delta only -> optional burn -> refund. Every failure reverts the whole transaction.
 
-V4 is **fail closed / unsupported**, not faked. The current Kyber build is generated with wallet as both `sender` and `recipient`, while an atomic call would execute with the executor as taker and needs output at the executor. Its opaque calldata has only router/address/amount checks today; recipient/taker fields and selector semantics are not decoded/proven. PONS hooked tokens also make direct V3/Universal Router routes unreliable; the current v4 code explicitly filters hooked pools for direct routes. Until a route built with executor sender+recipient is decoded, selector-allowlisted, and simulated through PositionManager `modifyLiquidities` as an approved operator, V4 atomic open/close must revert at the adapter gate.
+V4 is **fail closed / unsupported**, not faked. PONS hooked tokens also make direct V3/Universal Router routes unreliable; the current v4 code explicitly filters hooked pools for direct routes.
+
+The original blocker was that aggregator calldata was accepted on the strength of the API's JSON envelope alone — `routerAddress`, `amountIn`, `amountOut` — while the field that decides where the proceeds land, `dstReceiver`, was never read. An executor that swaps as itself and measures its own balance delta cannot rely on an unverified promise about the receiver.
+
+Preconditions for enabling V4, and their current state:
+
+1. **Route built with executor as sender and recipient** — done. `atomic-v4-plan.ts` builds with `EXECUTOR` on both sides, and `kyberPreflight` accepts a `taker` override so close/liquidation proofs can be built for the executor rather than the wallet.
+2. **Calldata decoded and proven** — done. `src/chain/kyberDecode.ts` decodes `swap` (`0xe21fd0e9`) and `swapSimpleMode` (`0x8af033fb`), and asserts srcToken/dstToken, `amount`, `minReturnAmount`, `srcAmounts` total, absence of injected fees, and `dstReceiver`. Both struct layouts are hashed at import and checked against the published selectors, so a wrong field list cannot decode into plausible garbage. Covered by `test/kyber-decode.test.ts`.
+3. **Selector allowlisted on the deployed executor** — *not done, requires an owner transaction.* `setSwapSelector(0xe21fd0e9,true)` must be sent while the contract is paused. Verify afterwards with `swapSelectorAllowed(0xe21fd0e9)`.
+4. **Simulated end to end through PositionManager `modifyLiquidities` as an approved operator** — *not done, requires a live funded rehearsal.* Until a probe open+close confirms `Opened`/`Closed`, `ownerOf(tokenId)==wallet`, zero executor balances, and the exact USDG delta, `lifecycle_verified()` stays false and unattended V4 entry remains blocked.
+
+Steps 3 and 4 are deliberately manual: both move real funds and neither can be discharged offline.
 
 ## Safety properties / limitations
 - Chain 4663 guard, owner-only, two-step ownership, starts paused, nonreentrant, 30-minute deadline cap, nonzero minima, exact temporary approvals reset to zero, pool/NFT identity checks, no arbitrary call/delegatecall, and zero lifecycle-token balance at entry/exit.

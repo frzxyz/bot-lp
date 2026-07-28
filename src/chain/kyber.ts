@@ -4,15 +4,21 @@
  * impact from buying on a single thin pool. Adapted from labrinyang/lp-terminal (kyber.ts +
  * kyberExec.ts) for a server-side ethers wallet.
  *
- * SECURITY: kyber calldata is opaque, so every swap passes 4 gates before broadcast:
+ * SECURITY: kyber calldata is opaque, so every swap passes 5 gates before broadcast:
  *   1. build.routerAddress must equal the whitelisted router (tx.to is ALWAYS the whitelist)
  *   2. tx value == amountIn for native ETH, else 0
  *   3. built amountIn == requested amountIn (spend integrity)
  *   4. built amountOut >= fresh quote − slippage (no execution drift)
+ *   5. the calldata decodes to the descriptor we asked for — tokens, amount, output
+ *      floor, and above all dstReceiver (see kyberDecode.ts)
+ *
+ * Gates 1-4 all read the API's JSON envelope; only gate 5 reads the bytes that are
+ * actually broadcast, which is where the receiver of the proceeds is decided.
  */
 import { ethers } from "ethers";
-import { env, cfg } from "../config.js";
+import { env, cfg, C } from "../config.js";
 import { wallet, provider, overrides } from "./client.js";
+import { assertKyberCalldata } from "./kyberDecode.js";
 import { logger } from "../util/log.js";
 
 const log = logger("kyber");
@@ -100,6 +106,16 @@ export async function kyberSwap(tokenIn: string, tokenOut: string, amountIn: big
   if (BigInt(built.amountIn) !== amountIn || BigInt(built.amountOut) < minOut) {
     throw new Error(`kyber build deviates (in ${built.amountIn}, out ${built.amountOut} < ${minOut})`);
   }
+  // Gate 5: the calldata itself must name this wallet as the receiver. The four
+  // checks above all read the API's JSON envelope; only this one reads the bytes
+  // that are actually broadcast.
+  assertKyberCalldata(built.data, {
+    tokenIn: nativeIn ? [KYBER_NATIVE, C.weth] : tokenIn,
+    tokenOut: tokenOut.toLowerCase() === KYBER_NATIVE.toLowerCase() ? [KYBER_NATIVE, C.weth] : tokenOut,
+    recipient: w.address,
+    amountIn,
+    minAmountOut: minOut,
+  });
 
   // ERC20 input → exact-amount approve to the router (native in carries value, no approve)
   if (!nativeIn) {
@@ -121,11 +137,20 @@ export async function kyberSwap(tokenIn: string, tokenOut: string, amountIn: big
   return { tx: tx.hash, amountOut: after > before ? after - before : 0n };
 }
 
-/** Exact reverse-route proof. Quote-only never approves, simulates, or sends. */
-export async function kyberPreflight(tokenIn:string, tokenOut:string, amountIn:bigint, quoteOnly=false):Promise<any> {
+/**
+ * Exact reverse-route proof. Quote-only never approves, simulates, or sends.
+ *
+ * `taker` overrides who the route is built for. The atomic V4 executor swaps as
+ * itself and needs the proceeds delivered to itself, so its proof must be built and
+ * verified against the executor address rather than the wallet — building for one
+ * address and executing as another is precisely the mismatch `ATOMIC_RUNBOOK.md`
+ * requires to be closed before V4 can be enabled.
+ */
+export async function kyberPreflight(tokenIn:string, tokenOut:string, amountIn:bigint, quoteOnly=false, taker?:string):Promise<any> {
   if(!kyberEnabled() || amountIn<=0n) throw new Error("Kyber unavailable or zero amount");
   const w=quoteOnly?null:wallet();
-  const sender=quoteOnly ? ethers.getAddress(process.env.RH_V4_EXPECTED_WALLET||"") : w!.address;
+  const fallback=quoteOnly ? ethers.getAddress(process.env.RH_V4_EXPECTED_WALLET||"") : w!.address;
+  const sender=taker ? ethers.getAddress(taker) : fallback;
   const slippageBps=Math.round((cfg.lp.slippagePct||5)*100);
   if(slippageBps<=0 || slippageBps>1000) throw new Error("slippage exceeds hard 10% liquidation cap");
   const route=await kyberRoute(tokenIn,tokenOut,amountIn); if(!route) throw new Error("no Kyber route");
@@ -134,6 +159,8 @@ export async function kyberPreflight(tokenIn:string, tokenOut:string, amountIn:b
   if(BigInt(built.amountIn)!==amountIn) throw new Error("Kyber amountIn mismatch");
   const quoted=BigInt(route.routeSummary.amountOut), minOut=quoted*BigInt(10000-slippageBps)/10000n;
   if(minOut<=0n || BigInt(built.amountOut)<minOut) throw new Error("invalid protected output");
+  // The API is asked for `sender`; this proves the bytes actually say so.
+  const decoded=assertKyberCalldata(built.data,{tokenIn,tokenOut,recipient:sender,amountIn,minAmountOut:minOut});
   const tx={to:env.kyberRouter,data:built.data,value:BigInt(built.transactionValue||"0"),from:sender};
   let gas:string|null=null;
   if(!quoteOnly){
@@ -141,7 +168,8 @@ export async function kyberPreflight(tokenIn:string, tokenOut:string, amountIn:b
     if(await erc.allowance!(sender,env.kyberRouter)<amountIn) throw new Error("approval required before executable route proof");
     await provider.call(tx); gas=(await provider.estimateGas(tx)).toString();
   }
-  return {venue:"kyber",target:env.kyberRouter,taker:sender,recipient:sender,amountInRaw:amountIn.toString(),quotedOutRaw:quoted.toString(),minOutRaw:minOut.toString(),slippageBps,calldata:built.data,value:String(tx.value),gas,executable:!quoteOnly,quoteOnly};
+  return {venue:"kyber",target:env.kyberRouter,taker:sender,recipient:decoded.dstReceiver,amountInRaw:amountIn.toString(),quotedOutRaw:quoted.toString(),minOutRaw:minOut.toString(),slippageBps,calldata:built.data,value:String(tx.value),gas,executable:!quoteOnly,quoteOnly,
+    proof:{selector:decoded.selector,dstReceiver:decoded.dstReceiver,srcToken:decoded.srcToken,dstToken:decoded.dstToken,minReturnAmount:String(decoded.minReturnAmount),decodedAt:new Date().toISOString()}};
 }
 
 /** Human route breakdown: "60% uniswapv3 · 40% up-v3". */
